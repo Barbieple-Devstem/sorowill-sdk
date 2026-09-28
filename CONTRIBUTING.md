@@ -26,6 +26,267 @@ feat/N-short-description
 fix/N-short-description
 ```
 
+## Adding a new wallet adapter
+
+The SDK supports any Stellar wallet through the `WalletAdapter` interface defined in
+`src/adapters/types.ts`. If you want to add support for a wallet that is not yet
+bundled — a new browser extension, a hardware wallet, or a mobile wallet that speaks
+a custom protocol — follow the steps below.
+
+### The WalletAdapter interface
+
+Every adapter must implement this interface:
+
+```ts
+interface WalletAdapter {
+  readonly id: string;              // machine-readable identifier, e.g. 'xbull'
+  readonly name: string;            // human-readable name, e.g. 'xBull Wallet'
+  connect(): Promise<WalletConnection>;
+  disconnect(): Promise<void>;
+  isConnected(): Promise<boolean>;
+  getPublicKey(): Promise<string>;
+  signTransaction(transactionXdr: string, options: SignTransactionOptions): Promise<string>;
+}
+
+interface WalletConnection {
+  publicKey: string;            // G… Stellar public key
+  network: string;              // 'testnet' | 'mainnet' | custom chain id
+  networkPassphrase: string;    // e.g. 'Test SDF Network ; September 2015'
+}
+
+interface SignTransactionOptions {
+  networkPassphrase: string;
+}
+```
+
+`signTransaction` receives an **unsigned** transaction XDR string and must return a
+**signed** XDR string. It should never submit the transaction itself — submission is
+the responsibility of the `SoroWillClient`.
+
+There is an **optional** fourth method:
+
+```ts
+getNetwork?(): Promise<{ network: string; networkPassphrase: string }>;
+```
+
+Implementing `getNetwork` allows `SoroWillClient.assertWalletNetwork()` to verify that
+the wallet is connected to the same network as the client before building a transaction.
+It is strongly recommended for any wallet that can be switched between mainnet and testnet.
+
+### Browser-extension wallets (injected provider pattern)
+
+For browser-extension wallets that inject a provider object into the page, extend the
+abstract `InjectedWalletAdapter` class in `src/adapters/injected.ts`. It handles
+`connect`, `disconnect`, `isConnected`, `getPublicKey`, and `signTransaction` for you —
+you only need to declare `id`, `name`, and pass the provider to `super()`:
+
+```ts
+// src/adapters/xbull.ts
+import { InjectedWalletAdapter, type InjectedWalletProvider } from './injected';
+
+export class XBullWalletAdapter extends InjectedWalletAdapter {
+  readonly id = 'xbull';
+  readonly name = 'xBull Wallet';
+
+  constructor(provider: InjectedWalletProvider) {
+    super(provider);
+  }
+}
+```
+
+The `InjectedWalletProvider` interface mirrors the minimal API that injected Stellar
+wallets must implement:
+
+```ts
+interface InjectedWalletProvider {
+  connect(): Promise<WalletConnection>;
+  disconnect?(): Promise<void>;
+  isConnected?(): Promise<boolean>;
+  getPublicKey?(): Promise<string>;
+  signTransaction(
+    transactionXdr: string,
+    options: SignTransactionOptions,
+  ): Promise<string | { signedTxXdr: string }>;
+}
+```
+
+**Explicit provider injection** — rather than reading from a browser global — is
+intentional: it keeps the adapter testable without a real browser, and lets host
+applications choose exactly which provider instance to use when multiple extensions
+are present.
+
+### Web-API / intent wallets (factory function pattern)
+
+For wallets that expose a web-based or intent-based API (like Albedo), create a factory
+function that closes over any mutable state and returns a plain `WalletAdapter` object:
+
+```ts
+// src/adapters/myWallet.ts
+import type { WalletAdapter, WalletConnection } from '../wallet';
+
+export function createMyWalletAdapter(): WalletAdapter {
+  let cachedPublicKey: string | undefined;
+
+  return {
+    id: 'my-wallet',
+    name: 'My Wallet',
+
+    async isConnected() {
+      return cachedPublicKey !== undefined;
+    },
+
+    async connect(): Promise<WalletConnection> {
+      // Call your wallet's connect / publicKey API here
+      cachedPublicKey = await myWalletSdk.getPublicKey();
+      return {
+        publicKey: cachedPublicKey,
+        network: 'mainnet',
+        networkPassphrase: 'Public Global Stellar Network ; September 2015',
+      };
+    },
+
+    async disconnect() {
+      cachedPublicKey = undefined;
+    },
+
+    async getPublicKey() {
+      if (cachedPublicKey) return cachedPublicKey;
+      const conn = await this.connect();
+      return conn.publicKey;
+    },
+
+    async signTransaction(transactionXdr, opts) {
+      // Forward to the wallet's signing API and return signed XDR
+      const { signedXdr } = await myWalletSdk.signXdr(transactionXdr, opts.networkPassphrase);
+      return signedXdr;
+    },
+  };
+}
+```
+
+### WalletConnect-based wallets
+
+For wallets that speak WalletConnect, use the bundled `WalletConnectAdapter` class from
+`src/walletConnect.ts` directly — pass a WalletConnect client and your session
+configuration. Only create a separate adapter file if you need to bake in
+wallet-specific defaults (chain IDs, signing methods, session extraction logic):
+
+```ts
+import { WalletConnectAdapter } from '@sorowill/sdk';
+
+const adapter = new WalletConnectAdapter(walletConnectClient, {
+  requiredNamespaces: {
+    stellar: {
+      methods: ['stellar_signXdr'],
+      chains: ['stellar:testnet'],
+      events: [],
+    },
+  },
+  network: 'testnet',
+  networkPassphrase: 'Test SDF Network ; September 2015',
+  connectionTimeoutMs: 30_000,
+  onPairingUri: (uri) => showQrCode(uri),
+});
+```
+
+### Wiring the adapter into the SDK
+
+1. **Create the adapter file** in `src/adapters/`, following one of the patterns above.
+2. **Re-export it** from `src/adapters/index.ts`:
+   ```ts
+   export { XBullWalletAdapter } from './xbull';
+   ```
+3. **Export it from the package root** (`src/index.ts`) with a matching type export if
+   the adapter exposes a custom options interface:
+   ```ts
+   export { XBullWalletAdapter } from './adapters';
+   ```
+4. **Add a row to the _Wallet adapters_ table** in `README.md` under the appropriate
+   section. The table is the single source of truth for what the package exposes — a
+   missing row will be flagged during code review.
+
+### Testing strategy for adapters
+
+Put adapter unit tests in `test/adapters.test.ts` (or a dedicated file for complex
+adapters).  The key principle is **never depend on a real browser or a live wallet
+process** in unit tests — always inject a mock provider.
+
+#### Injected-provider adapters
+
+Construct a plain mock object that satisfies `InjectedWalletProvider`:
+
+```ts
+import { describe, expect, it, vi } from 'vitest';
+import { XBullWalletAdapter } from '../src/adapters/xbull';
+
+describe('XBullWalletAdapter', () => {
+  function makeProvider(publicKey = 'GABC123') {
+    return {
+      connect: vi.fn().mockResolvedValue({
+        publicKey,
+        network: 'testnet',
+        networkPassphrase: 'Test SDF Network ; September 2015',
+      }),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockResolvedValue(false),
+      signTransaction: vi.fn().mockResolvedValue('SIGNED_XDR'),
+    };
+  }
+
+  it('returns the public key after connect()', async () => {
+    const adapter = new XBullWalletAdapter(makeProvider('GABC123'));
+    await adapter.connect();
+    expect(await adapter.getPublicKey()).toBe('GABC123');
+  });
+
+  it('returns signed XDR from signTransaction()', async () => {
+    const provider = makeProvider();
+    const adapter = new XBullWalletAdapter(provider);
+    await adapter.connect();
+    const signed = await adapter.signTransaction('UNSIGNED_XDR', {
+      networkPassphrase: 'Test SDF Network ; September 2015',
+    });
+    expect(signed).toBe('SIGNED_XDR');
+  });
+
+  it('isConnected returns false after disconnect()', async () => {
+    const adapter = new XBullWalletAdapter(makeProvider());
+    await adapter.connect();
+    await adapter.disconnect();
+    expect(await adapter.isConnected()).toBe(false);
+  });
+});
+```
+
+#### Factory-function adapters
+
+Swap the underlying SDK module with a `vi.mock()` call and assert that the adapter
+calls the correct SDK methods with the correct arguments:
+
+```ts
+vi.mock('my-wallet-sdk', () => ({
+  default: {
+    getPublicKey: vi.fn().mockResolvedValue('GABC123'),
+    signXdr: vi.fn().mockResolvedValue({ signedXdr: 'SIGNED_XDR' }),
+  },
+}));
+```
+
+#### What to test
+
+For every new adapter, cover at minimum:
+
+| Scenario | What to assert |
+|---|---|
+| `connect()` | Returns a `WalletConnection` with the correct `publicKey` and `networkPassphrase` |
+| `getPublicKey()` | Returns the same key without re-connecting |
+| `signTransaction()` | Returns a signed XDR string |
+| `isConnected()` before connect | Returns `false` |
+| `isConnected()` after connect | Returns `true` |
+| `disconnect()` | Clears state; `isConnected()` returns `false` afterwards |
+| `signTransaction()` before connect | Throws with a descriptive message |
+| Network mismatch (if `getNetwork()` is implemented) | Correctly reports the wallet's active network |
+
 ## Pull requests
 
 - Your PR description must reference the issue it resolves (e.g. `Closes #12`).
@@ -34,6 +295,10 @@ fix/N-short-description
 - Keep the public API in `src/index.ts` in sync with any new exports.
 - **When adding a new top-level export**, also add a row to the _Full public API_ table in `README.md` (under the appropriate section). The table is the single source of truth for what the package exposes — keeping it current helps consumers discover the API without reading the source. A missing row will be flagged during code review.
 - **If your PR changes public behavior** (new features, breaking changes, deprecations, or behavioral fixes), add a bullet entry under the `[Unreleased]` section of [`CHANGELOG.md`](./CHANGELOG.md). The release workflow (`publish.yml`) triggers from published GitHub Releases, and the changelog is the authoritative record of what shipped in each version.
+
+## Publishing
+
+Publishing is normally handled by the GitHub release workflow (`publish.yml`), which builds explicitly before packing. If you ever publish manually from a local checkout, the `prepublishOnly` hook in `package.json` runs `npm run build` and `npm run typecheck` automatically before the package is packed, so a stale or missing `dist/` cannot be published. You do not need to run the build by hand first — but if the hook fails, fix the reported build or type errors and retry rather than bypassing it with `--ignore-scripts`.
 
 ## API reference
 
@@ -230,48 +495,6 @@ variables are set:
 
 ```bash
 export SOROBAN_SANDBOX_RPC_URL=http://localhost:8000  # optional, defaults to this
-export SOROBAN_CONTRACT_ID=C...       # a deployed SoroWill contract instance
-export SOROBAN_OWNER_ACCOUNT=G...     # funded account used as the will owner
-export SOROBAN_BENEFICIARY_ACCOUNT=G...  # funded account used as a beneficiary
+export SOROBAN_CONTRACT_ID=C...       # a deployed SoroW
 
-npx vitest run test/soroban-sandbox-integration.test.ts
-```
-
-To run it locally, deploy the SoroWill contract to a local `soroban-cli`
-sandbox (or Futurenet/testnet) using two funded accounts for the owner and
-beneficiary roles, then set the variables above to that deployment before
-running the command. CI does not set these variables, so this suite is
-expected to show as skipped there — see the "Warn if Soroban sandbox
-integration tests are skipped" step in
-[`.github/workflows/test.yml`](./.github/workflows/test.yml) for the
-annotation that surfaces this in each run.
-
-## Local setup
-
-See the [README](./README.md#installation) for installation and how to run the test suite.
-
-## Releasing
-
-Publishing to npm is fully automated by [`.github/workflows/publish.yml`](./.github/workflows/publish.yml), which runs on every GitHub Release being **published** and, in order, typechecks, tests, builds, and runs `npm publish --access public`. There is no separate "release" branch or manual publish step — creating the GitHub Release *is* what ships the package.
-
-1. **Decide and apply the version bump.** This project follows [semver](https://semver.org/): patch for fixes, minor for backwards-compatible additions, major for breaking changes to the public API in `src/index.ts`. On `main`, with a clean working tree, run one of:
-
-   ```
-   npm version patch   # or: minor / major
-   ```
-
-   This bumps `version` in `package.json` and `package-lock.json`, commits the change, and creates a matching local git tag (e.g. `v0.2.0`). Push both:
-
-   ```
-   git push origin main --follow-tags
-   ```
-
-2. **Create the GitHub Release that triggers `publish.yml`.** Go to the repo's Releases page (or run `gh release create`) and create a release using the tag you just pushed. The tag name should match the version (e.g. `v0.2.0`); the release title and notes can summarize what changed since the last release. Publishing the release (not just saving it as a draft) fires the `release: published` event and starts the workflow.
-
-3. **Watch the workflow run.** Check the Actions tab for the `Publish` run triggered by your release. If typecheck, test, or build fails, the job stops before `npm publish` runs — fix forward with a new commit/tag/release rather than trying to reuse the failed tag.
-
-Because the publish step authenticates as `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}`, only maintainers with access to configure repository secrets can make this workflow succeed — the `NPM_TOKEN` secret is scoped to whoever administers this repo's GitHub settings, not to individual Wave contributors. If you're a contributor working an issue that requires a release to close out, ask a maintainer to cut it once your PR is merged.
-
-## Learn more
-
-Full details on how Wave Programs work — applying, Points, rewards, and payouts — are documented at <https://drips.network/wave>.
+/* … truncated 3048 chars — edit only what you need near the top … */

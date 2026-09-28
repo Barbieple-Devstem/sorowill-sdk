@@ -203,6 +203,33 @@ export class BeneficiaryValidationError extends SoroWillError {
 }
 
 /**
+ * Raised by `createWill` before any RPC call when the guardian list is
+ * invalid: a malformed Stellar address, a duplicate entry, or the owner's own
+ * address. `reason` names the problem and `guardian` the offending address.
+ */
+export class GuardianValidationError extends SoroWillError {
+  readonly reason: 'invalid_address' | 'duplicate' | 'owner_is_guardian';
+  readonly guardian: string;
+
+  constructor(
+    reason: 'invalid_address' | 'duplicate' | 'owner_is_guardian',
+    guardian: string,
+    options?: ErrorOptions,
+  ) {
+    const detail =
+      reason === 'invalid_address'
+        ? 'is not a valid Stellar public key'
+        : reason === 'duplicate'
+          ? 'appears more than once'
+          : 'is the will owner and cannot also be a guardian';
+    super(`Invalid guardian "${guardian}": address ${detail}.`, options);
+    this.name = new.target.name;
+    this.reason = reason;
+    this.guardian = guardian;
+  }
+}
+
+/**
  * Raised when the connected wallet's active network does not match the
  * network {@link SoroWillClient} was configured with — e.g. Freighter is set
  * to mainnet while the app instantiated a testnet client. Thrown before a
@@ -673,6 +700,33 @@ export class WebSocketNotConfiguredError extends SoroWillError {
   }
 }
 
+/**
+ * Raised when {@link mapContractError} encounters a numeric contract error
+ * code that has no registered mapping in the SDK. This can happen when the
+ * on-chain contract is upgraded and adds new error codes before the SDK is
+ * updated to match.
+ *
+ * The raw `code` and the full `rawMessage` from the RPC response are exposed
+ * as structured properties so callers (and monitoring pipelines) can log them
+ * with full context without embedding potentially sensitive data in the error
+ * message itself.
+ */
+export class UnknownContractErrorCodeError extends SoroWillError {
+  /** The numeric error code returned by the contract. */
+  readonly code: number;
+  /**
+   * The full raw error text from the RPC response. May contain contract
+   * addresses or other context. Do not forward to third-party error trackers
+   * without redaction.
+   */
+  readonly rawMessage: string;
+
+  constructor(code: number, rawMessage: string, options?: ErrorOptions) {
+    super(`Contract error: ${code}`, options);
+    this.code = code;
+    this.rawMessage = rawMessage;
+  }
+}
 /** Converts a Soroban contract error code embedded in an RPC error into its typed SDK error. */
 export function mapContractError(error: unknown): Error {
   if (error instanceof WillContractError || error instanceof RequestTimeoutError) {
@@ -683,6 +737,27 @@ export function mapContractError(error: unknown): Error {
     /Error\(Contract,\s*#?(\d+)\)/i.exec(text) ??
     /(?:contract error|contracterror|error code)[^\d#]*#?(\d+)/i.exec(text);
   const codeText = match?.[1];
-  const ErrorClass = codeText === undefined ? undefined : CONTRACT_ERRORS[Number(codeText)];
-  return ErrorClass === undefined ? (error instanceof Error ? error : new SoroWillError(text)) : new ErrorClass({ cause: error });
+
+  if (codeText === undefined) {
+    // No numeric error code found — return the original error or wrap in SoroWillError.
+    return error instanceof Error ? error : new SoroWillError(text);
+  }
+
+  const code = Number(codeText);
+  const ErrorClass = CONTRACT_ERRORS[code];
+
+  if (ErrorClass !== undefined) {
+    return new ErrorClass({ cause: error });
+  }
+
+  // Unknown error code — the contract may have been upgraded with new codes
+  // that the SDK does not yet know about.  Log the full context so developers
+  // and monitoring pipelines can diagnose the problem, then surface a
+  // user-friendly message via UnknownContractErrorCodeError.
+  console.warn(
+    `[SoroWill] Unrecognised contract error code ${code}. ` +
+      'The contract may have been upgraded. Update @sorowill/sdk to get typed errors for new codes.',
+    { code, rawMessage: text },
+  );
+  return new UnknownContractErrorCodeError(code, text, { cause: error });
 }

@@ -5,6 +5,66 @@ export interface TransactionMatchOptions {
   preparedTransactionXdr: string;
   networkPassphrase: string;
   context: string;
+  /**
+   * Optional Soroban simulation response associated with the prepared
+   * transaction.  When provided, the simulation's `status` field is checked
+   * before any structural comparison is performed.  A status other than
+   * `"SUCCESS"` throws {@link SimulationResultError} immediately so that
+   * invalid prepared transactions are caught before they reach the network.
+   *
+   * Pass the raw object returned by `rpc.Server.simulateTransaction()` (or
+   * `rpc.Server.prepareTransaction()`'s underlying simulation response).
+   */
+  simulationResponse?: SimulationResponse;
+}
+
+/**
+ * Minimal shape of a Soroban RPC simulation response needed for status
+ * validation.  Using a structural type avoids a hard dependency on the
+ * `@stellar/stellar-sdk` RPC type hierarchy.
+ */
+export interface SimulationResponse {
+  /** `"SUCCESS"` indicates a simulation that the contract accepted. */
+  status?: string;
+  /** Human-readable error detail returned by the RPC node on failure. */
+  error?: string;
+}
+
+/**
+ * Raised by {@link assertPreparedTransactionMatchesIntendedOperation} when the
+ * accompanying Soroban simulation response does not carry a `"SUCCESS"` status.
+ *
+ * A prepared transaction backed by a failed simulation will be rejected
+ * on-chain, so throwing here saves a full RPC submission round-trip.
+ */
+export class SimulationResultError extends Error {
+  /**
+   * The status value returned by the simulation, e.g. `"ERROR"` or
+   * `"FAILED"`.  Never embedded in the message because it may contain raw
+   * contract addresses or other request-specific data.
+   */
+  readonly simulationStatus: string | undefined;
+  /**
+   * The raw error string from the simulation response, if present.  Kept as a
+   * structured property rather than embedded in the message for the same
+   * privacy reasons as {@link simulationStatus}.
+   */
+  readonly simulationError: string | undefined;
+
+  constructor(
+    context: string,
+    simulationStatus: string | undefined,
+    simulationError: string | undefined,
+    options?: ErrorOptions,
+  ) {
+    super(
+      `Soroban simulation for ${context} did not succeed — the prepared transaction should not be submitted.`,
+      options,
+    );
+    this.name = 'SimulationResultError';
+    this.simulationStatus = simulationStatus;
+    this.simulationError = simulationError;
+  }
 }
 
 function operationsMatch(intended: xdr.Operation, prepared: xdr.Operation): boolean {
@@ -35,8 +95,19 @@ function operationsMatch(intended: xdr.Operation, prepared: xdr.Operation): bool
     }
 
     if (intendedHostFn.switch() === xdr.HostFunctionType.hostFunctionTypeInvokeContract()) {
-      const intendedArgs = intendedHostFn.invokeContract().args();
-      const preparedArgs = preparedHostFn.invokeContract().args();
+      const intendedInvoke = intendedHostFn.invokeContract();
+      const preparedInvoke = preparedHostFn.invokeContract();
+
+      if (
+        intendedInvoke.contractAddress().toXDR('base64') !==
+          preparedInvoke.contractAddress().toXDR('base64') ||
+        intendedInvoke.functionName().toString() !== preparedInvoke.functionName().toString()
+      ) {
+        return false;
+      }
+
+      const intendedArgs = intendedInvoke.args();
+      const preparedArgs = preparedInvoke.args();
 
       if (!intendedArgs || !preparedArgs || intendedArgs.length !== preparedArgs.length) {
         return false;
@@ -104,6 +175,20 @@ function readOperationsFromEnvelope(
 export function assertPreparedTransactionMatchesIntendedOperation(
   options: TransactionMatchOptions,
 ): void {
+  // Check the simulation result status before doing any structural validation.
+  // A prepared transaction backed by a failed simulation will be rejected
+  // on-chain, so we surface the problem here rather than at submission time.
+  if (options.simulationResponse !== undefined) {
+    const status = options.simulationResponse.status;
+    if (status !== undefined && status !== 'SUCCESS') {
+      throw new SimulationResultError(
+        options.context,
+        status,
+        options.simulationResponse.error,
+      );
+    }
+  }
+
   const intendedOperations = readOperationsFromEnvelope(
     options.intendedTransactionXdr,
     options.networkPassphrase,

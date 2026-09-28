@@ -5,6 +5,7 @@ const { mockState, mockFreighterApi } = vi.hoisted(() => ({
   mockState: {
     sendTransaction: vi.fn(),
     pollTransaction: vi.fn(),
+    getAccount: vi.fn(),
   },
   mockFreighterApi: {
     getAddress: vi.fn(),
@@ -49,6 +50,8 @@ vi.mock('@stellar/stellar-sdk', () => {
 
   class MockTransaction {
     public fee = '1000';
+    public source = 'GSOURCE_ACCOUNT';
+    public sequence = '101';
 
     constructor(private _xdr = 'MOCK_TX_XDR') {}
 
@@ -109,6 +112,7 @@ vi.mock('@stellar/stellar-sdk', () => {
 
     sendTransaction = mockState.sendTransaction;
     pollTransaction = mockState.pollTransaction;
+    getAccount = mockState.getAccount;
   }
 
   const BASE_FEE = '100';
@@ -151,6 +155,8 @@ import {
   signFeeBumpXdr,
   submitFeeBumpTransaction,
   submitFeeBump,
+  validateInnerTransactionSequence,
+  StaleTransactionSequenceError,
 } from '../src/feeBump';
 import { InvalidPublicKeyError } from '../src/errors';
 
@@ -170,6 +176,8 @@ function makeFeeBumpXdr(innerXdr: string, feeSource: Keypair, networkPassphrase:
 describe('feeBump', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: account sequence is 100, inner transaction sequence is 101 → still valid.
+    mockState.getAccount.mockResolvedValue({ sequence: '100' });
   });
 
   describe('buildFeeBumpXdr', () => {
@@ -182,6 +190,18 @@ describe('feeBump', () => {
       });
 
       expect(xdr).toBe('MOCK_TX_XDR');
+    });
+
+    it('should default the fee to the inner transaction fee when omitted', async () => {
+      const spy = vi.spyOn(TransactionBuilder as any, 'buildFeeBumpTransaction');
+      await buildFeeBumpXdr({
+        network: 'testnet',
+        innerTransactionXdr: 'INNER_TX_XDR',
+        feeSourcePublicKey: 'GFEEsourcepublickey',
+      });
+
+      expect(spy).toHaveBeenCalledWith(expect.anything(), '1000', expect.anything(), expect.anything());
+      spy.mockRestore();
     });
 
     it('should accept realistic Soroban fee amounts', async () => {
@@ -238,6 +258,42 @@ describe('feeBump', () => {
       });
       expect(mockState.sendTransaction).toHaveBeenCalledTimes(1);
       expect(mockState.pollTransaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws a retryable error on TRY_AGAIN_LATER without polling', async () => {
+      mockState.sendTransaction.mockResolvedValueOnce({ status: 'TRY_AGAIN_LATER', hash: 'H' });
+
+      await expect(
+        submitFeeBumpTransaction({ network: 'testnet', feeBumpXdr: 'XDR' }),
+      ).rejects.toThrow(/TRY_AGAIN_LATER/);
+      expect(mockState.pollTransaction).not.toHaveBeenCalled();
+    });
+
+    it('polls the existing hash on DUPLICATE', async () => {
+      mockState.sendTransaction.mockResolvedValueOnce({ status: 'DUPLICATE', hash: 'DUP_HASH' });
+      mockState.pollTransaction.mockResolvedValueOnce({ status: 'SUCCESS', createdAt: 42 });
+
+      const result = await submitFeeBumpTransaction({ network: 'testnet', feeBumpXdr: 'XDR' });
+
+      expect(result).toEqual({ txHash: 'DUP_HASH', createdAt: 42 });
+      expect(mockState.pollTransaction).toHaveBeenCalledWith('DUP_HASH', { attempts: 30 });
+    });
+
+    it('uses an injected rpcServer', async () => {
+      const rpcServer = {
+        sendTransaction: vi.fn().mockResolvedValue({ status: 'PENDING', hash: 'INJ' }),
+        pollTransaction: vi.fn().mockResolvedValue({ status: 'SUCCESS', createdAt: 7 }),
+      };
+
+      const result = await submitFeeBumpTransaction({
+        network: 'testnet',
+        feeBumpXdr: 'XDR',
+        rpcServer,
+      });
+
+      expect(result).toEqual({ txHash: 'INJ', createdAt: 7 });
+      expect(rpcServer.sendTransaction).toHaveBeenCalledTimes(1);
+      expect(mockState.sendTransaction).not.toHaveBeenCalled();
     });
 
     it('should throw error with diagnostics when submission fails', async () => {
@@ -456,5 +512,97 @@ describe('feeBump configuration', () => {
     };
 
     expect(options.pollAttempts).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #496 — sequence-number validation before wrapping in a fee bump
+// ---------------------------------------------------------------------------
+describe('validateInnerTransactionSequence', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('resolves when the inner transaction sequence is greater than the account sequence', async () => {
+    // inner tx sequence = 101 (set by MockTransaction default), account = 100
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '100' });
+
+    await expect(
+      validateInnerTransactionSequence('INNER_TX_XDR', 'testnet'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('throws StaleTransactionSequenceError when the inner sequence equals the account sequence', async () => {
+    // inner tx sequence = 101, account already at 101 → stale
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '101' });
+
+    await expect(
+      validateInnerTransactionSequence('INNER_TX_XDR', 'testnet'),
+    ).rejects.toThrow(StaleTransactionSequenceError);
+  });
+
+  it('throws StaleTransactionSequenceError when the inner sequence is less than the account sequence', async () => {
+    // inner tx sequence = 101, account already at 200 → definitely stale
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '200' });
+
+    await expect(
+      validateInnerTransactionSequence('INNER_TX_XDR', 'testnet'),
+    ).rejects.toThrow(StaleTransactionSequenceError);
+  });
+
+  it('StaleTransactionSequenceError carries innerSequence and accountSequence properties', async () => {
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '101' });
+
+    try {
+      await validateInnerTransactionSequence('INNER_TX_XDR', 'testnet');
+      expect.fail('should have thrown');
+    } catch (err: any) {
+      expect(err).toBeInstanceOf(StaleTransactionSequenceError);
+      expect(err.innerSequence).toBe('101');
+      expect(err.accountSequence).toBe('101');
+      expect(err.message).toContain('has already been used');
+    }
+  });
+
+  it('includes the stale sequence values in the error message', async () => {
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '150' });
+
+    await expect(
+      validateInnerTransactionSequence('INNER_TX_XDR', 'testnet'),
+    ).rejects.toThrow('Inner transaction sequence (101) has already been used');
+  });
+});
+
+describe('buildFeeBumpXdr – sequence validation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('rejects with StaleTransactionSequenceError when wrapping a stale transaction', async () => {
+    // The inner tx mock has sequence = 101; simulate the account being at 101 already.
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '101' });
+
+    await expect(
+      buildFeeBumpXdr({
+        network: 'testnet',
+        innerTransactionXdr: 'STALE_INNER_TX_XDR',
+        feeSourcePublicKey: 'GFEEsourcepublickey',
+        fee: '5000',
+      }),
+    ).rejects.toThrow(StaleTransactionSequenceError);
+  });
+
+  it('proceeds normally when the inner transaction sequence is still valid', async () => {
+    // account = 100, inner tx sequence = 101 → valid
+    mockState.getAccount.mockResolvedValueOnce({ sequence: '100' });
+
+    const xdr = await buildFeeBumpXdr({
+      network: 'testnet',
+      innerTransactionXdr: 'FRESH_INNER_TX_XDR',
+      feeSourcePublicKey: 'GFEEsourcepublickey',
+      fee: '5000',
+    });
+
+    expect(xdr).toBe('MOCK_TX_XDR');
   });
 });
