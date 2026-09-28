@@ -179,6 +179,7 @@ export {
   setContractErrorMap,
   getContractErrorMap,
   UnsupportedBatchSizeError,
+  UnknownContractErrorCodeError,
 } from './errors';
 export type { ContractErrorFactory } from './errors';
 

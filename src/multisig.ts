@@ -240,9 +240,24 @@ export class MultisigCollector {
       throw new Error('Transaction envelope is not a V1 transaction');
     }
 
-    for (const sig of this._signatures.length > 0 ? this._signatures : [{ signerPublicKey: '', signature: '' }]) {
-      if (!sig.signature) continue;
-      const decoratedSignature = xdr.DecoratedSignature.fromXDR(sig.signature, 'base64');
+    // Decode all collected signatures into DecoratedSignature objects.
+    const decoratedSignatures = this._signatures
+      .filter((sig) => sig.signature)
+      .map((sig) => xdr.DecoratedSignature.fromXDR(sig.signature, 'base64'));
+
+    // Sort by the 4-byte hint (public key hint) in ascending lexicographic
+    // order.  Stellar validators accept signatures in any order, but a
+    // canonical, deterministic order prevents cross-wallet incompatibility
+    // where two wallets assemble the same set of signatures in different
+    // sequences and produce XDR that diverges byte-for-byte, breaking
+    // external tooling that compares transactions by XDR equality.
+    decoratedSignatures.sort((a, b) => {
+      const hintA = Buffer.from(a.hint());
+      const hintB = Buffer.from(b.hint());
+      return hintA.compare(hintB);
+    });
+
+    for (const decoratedSignature of decoratedSignatures) {
       txV1.signatures().push(decoratedSignature);
     }
 

@@ -156,6 +156,14 @@ export class ReadCache {
     this.persistence = options.persistence;
     this.maxEntries = options.maxEntries;
     this.readyPromise = this.hydrate();
+
+    // Register a locale-change listener in browser environments when opted in.
+    if (options.invalidateOnLocaleChange && typeof window !== 'undefined') {
+      this.localeChangeHandler = () => {
+        this.clear();
+      };
+      window.addEventListener('languagechange', this.localeChangeHandler);
+    }
   }
 
   async ready(): Promise<void> {

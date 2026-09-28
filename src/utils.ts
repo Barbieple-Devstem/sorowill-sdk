@@ -1,5 +1,6 @@
 import { StrKey } from '@stellar/stellar-sdk';
 
+import { BeneficiaryValidationError } from './errors';
 import type { Beneficiary, Will } from './types';
 import { WillStatus } from './types';
 
@@ -241,6 +242,12 @@ export const MAX_GUARDIANS = 3;
  * Percentages are on the SDK's 0-100 scale. `SoroWillClient` scales them to
  * the contract's basis points (summing to 10,000) when it submits a
  * transaction.
+ *
+ * @throws {BeneficiaryValidationError} When the list contains duplicate
+ *   addresses — the message explicitly names the duplicated address so
+ *   callers can surface a meaningful error to the user. All other validation
+ *   failures (empty list, too many entries, bad percentages, wrong sum)
+ *   return `false` as before.
  */
 export function validateBeneficiaries(beneficiaries: Beneficiary[]): boolean {
   if (beneficiaries.length === 0 || beneficiaries.length > MAX_BENEFICIARIES) {
@@ -255,6 +262,21 @@ export function validateBeneficiaries(beneficiaries: Beneficiary[]): boolean {
   if (!beneficiaries.every((b) => Number.isInteger(b.percentage) && b.percentage > 0)) {
     return false;
   }
+
+  // Check for duplicate addresses — must come before the percentage sum check
+  // so the error message can name the offending address rather than just
+  // reporting an invalid sum.
+  const seen = new Set<string>();
+  for (const b of beneficiaries) {
+    if (seen.has(b.address)) {
+      throw new BeneficiaryValidationError(
+        `Duplicate beneficiary address: "${b.address}" appears more than once. ` +
+          'Each beneficiary must have a unique Stellar address.',
+      );
+    }
+    seen.add(b.address);
+  }
+
   const sum = beneficiaries.reduce((acc, b) => acc + b.percentage, 0);
   return sum === 100;
 }
