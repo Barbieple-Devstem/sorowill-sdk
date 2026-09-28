@@ -607,6 +607,12 @@ export class SoroWillClient {
   private readonly readCache: ReadCache | undefined;
   private readonly retryOptions: RpcRetryOptions;
   private specPromise: Promise<InstanceType<typeof Spec>> | undefined;
+  /**
+   * Per-network cache for fee stats results. Keyed by network passphrase so
+   * that switching networks (e.g. testnet → mainnet mid-session) never returns
+   * stale fees from the previous network (#500).
+   */
+  private feeStatsCache: Map<string, rpc.Api.GetFeeStatsResponse>;
   private readonly debug: boolean;
   private readonly debugLogger: DebugLogger;
   private readonly autoFeeBumpOnTimeout: boolean;
@@ -683,6 +689,8 @@ export class SoroWillClient {
     if (!Number.isFinite(this.transactionTimeoutSeconds) || this.transactionTimeoutSeconds <= 0) {
       throw new RangeError('transactionTimeoutSeconds must be a finite number greater than zero');
     }
+
+    this.feeStatsCache = new Map();
 
     if (this.readCache && options.eventSource) {
       this.eventSubscription = options.eventSource.subscribe((event) => {
@@ -2068,6 +2076,11 @@ export class SoroWillClient {
   /**
    * Returns network-wide inclusion-fee statistics (`rpc.Api.GetFeeStatsResponse`).
    *
+   * Results are cached per network passphrase so that switching networks
+   * mid-session (e.g. the user toggles Freighter from mainnet to testnet)
+   * never serves stale fees from the wrong network (#500). Call
+   * `flushFeeStatsCache()` to invalidate manually.
+   *
    * @throws {SoroWillError} If the configured RPC server does not support `getFeeStats`.
    */
   async getNetworkFeeStats(options?: RequestOptions): Promise<rpc.Api.GetFeeStatsResponse> {
@@ -2075,7 +2088,34 @@ export class SoroWillClient {
     if (typeof server.getFeeStats !== 'function') {
       throw new SoroWillError('The configured RPC server does not support getFeeStats');
     }
-    return this.rpc(() => server.getFeeStats!(), options);
+
+    // Detect network changes: if the wallet reports a different passphrase than
+    // the one we last cached stats for, flush the whole cache first (#500).
+    const currentPassphrase = await this.resolveCurrentNetworkPassphrase();
+    if (currentPassphrase !== this.networkPassphrase) {
+      // The wallet is on a different network than the client was configured for.
+      // Clear every cached entry so nothing stale leaks through.
+      this.feeStatsCache.clear();
+    }
+
+    const cacheKey = currentPassphrase;
+    const cached = this.feeStatsCache.get(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const result = await this.rpc(() => server.getFeeStats!(), options);
+    this.feeStatsCache.set(cacheKey, result);
+    return result;
+  }
+
+  /**
+   * Flushes the in-memory fee-stats cache for all networks.
+   * Call this after detecting a wallet network switch to guarantee the next
+   * `getNetworkFeeStats()` call fetches fresh data from the RPC node.
+   */
+  flushFeeStatsCache(): void {
+    this.feeStatsCache.clear();
   }
 
   async assertWalletNetwork(network: { networkPassphrase: string }): Promise<void> {
@@ -2198,5 +2238,25 @@ export class SoroWillClient {
 
   private async getWalletPublicKey(): Promise<string> {
     return this.wallet.getPublicKey();
+  }
+
+  /**
+   * Returns the wallet's currently reported network passphrase, falling back
+   * to the client's configured passphrase when the wallet does not implement
+   * `getNetwork()`. Used by `getNetworkFeeStats` to key the per-network cache
+   * and detect mid-session network switches (#500).
+   */
+  private async resolveCurrentNetworkPassphrase(): Promise<string> {
+    if (typeof this.wallet.getNetwork === 'function') {
+      try {
+        const details = await this.wallet.getNetwork();
+        if (details.networkPassphrase) {
+          return details.networkPassphrase;
+        }
+      } catch {
+        // If getNetwork() fails for any reason, fall back to the configured passphrase.
+      }
+    }
+    return this.networkPassphrase;
   }
 }
