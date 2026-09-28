@@ -44,11 +44,19 @@ export {
   signFeeBumpXdr,
   submitFeeBump,
   submitFeeBumpTransaction,
+  validateInnerTransactionSequence,
+  StaleTransactionSequenceError,
 } from './feeBump';
 export type {
   FeeBumpOptions,
   SubmitFeeBumpOptions,
 } from './feeBump';
+
+export { SimulationResultError } from './txValidation';
+export type {
+  SimulationResponse,
+  TransactionMatchOptions,
+} from './txValidation';
 
 export type {
   BatchOperation,
@@ -81,6 +89,7 @@ export {
   LocalStorageWalletConnectSessionStore,
   MemoryWalletConnectSessionStore,
   WalletConnectAdapter,
+  WalletConnectTimeoutError,
 } from './walletConnect';
 export type {
   WalletConnectAdapterOptions,

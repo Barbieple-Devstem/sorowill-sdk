@@ -4,6 +4,7 @@ import {
   LocalStorageWalletConnectSessionStore,
   MemoryWalletConnectSessionStore,
   WalletConnectAdapter,
+  WalletConnectTimeoutError,
   type WalletConnectClient,
   type WalletConnectSession,
 } from '../src/walletConnect';
@@ -435,5 +436,244 @@ describe('LocalStorageWalletConnectSessionStore', () => {
 
     expect(setKeyUsed).toBe('sorowill:walletconnect:session-topic');
     expect(await store.getSessionTopic()).toBe('default-key-topic');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #498 — WalletConnect connection timeout
+// ---------------------------------------------------------------------------
+describe('WalletConnectAdapter – connection timeout', () => {
+  it('throws WalletConnectTimeoutError when approval hangs beyond connectionTimeoutMs', async () => {
+    vi.useFakeTimers();
+
+    let disconnectCalled = false;
+    const hangingClient: WalletConnectClient = {
+      async connect() {
+        return {
+          uri: 'wc:test',
+          // This promise never resolves, simulating a wallet that does not respond.
+          approval(): Promise<WalletConnectSession> {
+            return new Promise(() => {
+              /* intentionally never resolves */
+            });
+          },
+        };
+      },
+      async disconnect() {
+        disconnectCalled = true;
+      },
+      async getSession() {
+        return null;
+      },
+      async request() {
+        throw new Error('should not be called');
+      },
+    };
+
+    const adapter = new WalletConnectAdapter(hangingClient, {
+      connectionTimeoutMs: 5_000,
+    });
+
+    const connectPromise = adapter.connect();
+
+    // Advance time past the timeout
+    await vi.advanceTimersByTimeAsync(6_000);
+
+    await expect(connectPromise).rejects.toThrow(WalletConnectTimeoutError);
+
+    vi.useRealTimers();
+  });
+
+  it('WalletConnectTimeoutError carries the configured timeoutMs', async () => {
+    vi.useFakeTimers();
+
+    const hangingClient: WalletConnectClient = {
+      async connect() {
+        return {
+          uri: 'wc:test',
+          approval(): Promise<WalletConnectSession> {
+            return new Promise(() => {/* never resolves */});
+          },
+        };
+      },
+      async disconnect() {},
+      async getSession() { return null; },
+      async request() { throw new Error('unreachable'); },
+    };
+
+    const adapter = new WalletConnectAdapter(hangingClient, {
+      connectionTimeoutMs: 10_000,
+    });
+
+    const connectPromise = adapter.connect();
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    try {
+      await connectPromise;
+      expect.fail('should have thrown');
+    } catch (err: any) {
+      expect(err).toBeInstanceOf(WalletConnectTimeoutError);
+      expect(err.timeoutMs).toBe(10_000);
+      expect(err.message).toContain('10000ms');
+    }
+
+    vi.useRealTimers();
+  });
+
+  it('cleans up (calls disconnect) when the connection times out', async () => {
+    vi.useFakeTimers();
+
+    let disconnectCalledWithReason: { code: number; message: string } | undefined;
+    const hangingClient: WalletConnectClient = {
+      async connect() {
+        return {
+          uri: 'wc:test',
+          approval(): Promise<WalletConnectSession> {
+            return new Promise(() => {/* never resolves */});
+          },
+        };
+      },
+      async disconnect(options) {
+        disconnectCalledWithReason = options.reason;
+      },
+      async getSession() { return null; },
+      async request() { throw new Error('unreachable'); },
+    };
+
+    const adapter = new WalletConnectAdapter(hangingClient, {
+      connectionTimeoutMs: 3_000,
+    });
+
+    const connectPromise = adapter.connect();
+    await vi.advanceTimersByTimeAsync(4_000);
+
+    await expect(connectPromise).rejects.toBeInstanceOf(WalletConnectTimeoutError);
+    // Resources should have been cleaned up
+    expect(disconnectCalledWithReason).toBeDefined();
+    expect(disconnectCalledWithReason?.code).toBe(6001);
+
+    vi.useRealTimers();
+  });
+
+  it('succeeds normally when approval resolves before the timeout', async () => {
+    vi.useFakeTimers();
+
+    const session = {
+      topic: 'topic-fast',
+      namespaces: {
+        stellar: {
+          accounts: ['stellar:testnet:GFASTACCOUNT'],
+          methods: ['stellar_signXdr'],
+          events: [],
+        },
+      },
+    };
+
+    const fastClient: WalletConnectClient = {
+      async connect() {
+        return {
+          uri: 'wc:fast',
+          async approval() {
+            return session;
+          },
+        };
+      },
+      async disconnect() {},
+      async getSession(topic) {
+        return topic === session.topic ? session : null;
+      },
+      async request<T>() {
+        return { signedTxXdr: 'SIGNED_XDR' } as T;
+      },
+    };
+
+    const adapter = new WalletConnectAdapter(fastClient, {
+      connectionTimeoutMs: 30_000,
+    });
+
+    const connectPromise = adapter.connect();
+    // Don't advance time – the approval resolves synchronously in our mock
+    const connection = await connectPromise;
+
+    expect(connection.publicKey).toBe('GFASTACCOUNT');
+
+    vi.useRealTimers();
+  });
+
+  it('uses a default timeout of 30 seconds when connectionTimeoutMs is not set', async () => {
+    vi.useFakeTimers();
+
+    const hangingClient: WalletConnectClient = {
+      async connect() {
+        return {
+          uri: 'wc:test',
+          approval(): Promise<WalletConnectSession> {
+            return new Promise(() => {/* never resolves */});
+          },
+        };
+      },
+      async disconnect() {},
+      async getSession() { return null; },
+      async request() { throw new Error('unreachable'); },
+    };
+
+    // No connectionTimeoutMs → should use the 30 s default
+    const adapter = new WalletConnectAdapter(hangingClient);
+    const connectPromise = adapter.connect();
+
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    await expect(connectPromise).rejects.toBeInstanceOf(WalletConnectTimeoutError);
+
+    vi.useRealTimers();
+  });
+
+  it('disables the timeout when connectionTimeoutMs is 0', async () => {
+    vi.useFakeTimers();
+
+    let approveResolve: (session: WalletConnectSession) => void;
+    const session = {
+      topic: 'topic-slow',
+      namespaces: {
+        stellar: {
+          accounts: ['stellar:testnet:GSLOWACCOUNT'],
+          methods: ['stellar_signXdr'],
+          events: [],
+        },
+      },
+    };
+
+    const slowClient: WalletConnectClient = {
+      async connect() {
+        return {
+          uri: 'wc:slow',
+          approval(): Promise<WalletConnectSession> {
+            return new Promise((resolve) => {
+              approveResolve = resolve;
+            });
+          },
+        };
+      },
+      async disconnect() {},
+      async getSession(topic) {
+        return topic === session.topic ? session : null;
+      },
+      async request<T>() {
+        return { signedTxXdr: 'SIGNED_XDR' } as T;
+      },
+    };
+
+    const adapter = new WalletConnectAdapter(slowClient, { connectionTimeoutMs: 0 });
+    const connectPromise = adapter.connect();
+
+    // Advance well past any default timeout — should not throw
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // Now resolve manually — should succeed without an error
+    approveResolve!(session);
+    const connection = await connectPromise;
+    expect(connection.publicKey).toBe('GSLOWACCOUNT');
+
+    vi.useRealTimers();
   });
 });

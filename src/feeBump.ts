@@ -143,6 +143,14 @@ export function estimateBatchFee(invocationCount: number, baseFee: number = 100)
  * their account loaded — no Freighter connection is required on the
  * user's side.
  *
+ * Before building the envelope this function validates that the inner
+ * transaction's sequence number has not yet been consumed on-chain.  If the
+ * inner transaction was prepared, cached, and is now being retried after a
+ * delay, the sequence may already be spent — in that case
+ * {@link StaleTransactionSequenceError} is thrown so the caller can rebuild
+ * with a fresh sequence rather than submitting a fee-bump that will fail with
+ * `txBAD_SEQ`.
+ *
  * @returns The base64-encoded XDR of the fee-bump transaction envelope.
  * @throws {InvalidPublicKeyError} if `feeSourcePublicKey` is not a valid Stellar public key.
  * @throws {ExorbitantFeeError} if `fee` exceeds `maxFeeMultiplier` times the base fee.
