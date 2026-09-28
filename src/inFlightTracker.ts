@@ -4,6 +4,8 @@ type OperationResult<T> = Promise<T>;
 interface InFlightOperation<T> {
   promise: OperationResult<T>;
   controller: AbortController;
+  /** Wall-clock ms when this entry was added. Used for TTL eviction (issue #487). */
+  createdAt: number;
 }
 
 /**
@@ -100,8 +102,19 @@ export class InFlightTracker {
   ): PromiseLike<T> {
     const key = this.getKey(willId, method, clientId);
 
-    if (this.inFlight.has(key)) {
-      return this.inFlight.get(key)!.promise as PromiseLike<T>;
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      if (!this.isExpired(existing)) {
+        return existing.promise as PromiseLike<T>;
+      }
+      // Expired entry — evict and start a fresh operation.
+      this.evict(key, existing);
+    }
+
+    // Prune expired entries and enforce the size cap before adding a new one.
+    this.pruneExpired();
+    if (this.inFlight.size >= this.maxInFlight) {
+      this.evictOldest();
     }
 
     const controller = new AbortController();
@@ -153,6 +166,53 @@ export class InFlightTracker {
     if (op) {
       op.controller.abort();
       this.inFlight.delete(key);
+    }
+  }
+
+  /**
+   * Returns the current number of tracked in-flight operations.
+   * Useful for monitoring and testing.
+   */
+  get size(): number {
+    return this.inFlight.size;
+  }
+
+  // ─── Private helpers ────────────────────────────────────────────────────
+
+  private isExpired(op: InFlightOperation<unknown>): boolean {
+    return Date.now() - op.createdAt > this.ttlMs;
+  }
+
+  private evict(key: OperationKey, op: InFlightOperation<unknown>): void {
+    op.controller.abort();
+    this.inFlight.delete(key);
+  }
+
+  /** Removes all entries whose TTL has elapsed. */
+  private pruneExpired(): void {
+    const now = Date.now();
+    for (const [key, op] of this.inFlight) {
+      if (now - op.createdAt > this.ttlMs) {
+        op.controller.abort();
+        this.inFlight.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Evicts the oldest entry when the map is at capacity.
+   *
+   * `Map` preserves insertion order, so the first entry yielded by the
+   * iterator is always the oldest.
+   */
+  private evictOldest(): void {
+    const firstKey = this.inFlight.keys().next().value as OperationKey | undefined;
+    if (firstKey !== undefined) {
+      const op = this.inFlight.get(firstKey);
+      if (op) {
+        op.controller.abort();
+        this.inFlight.delete(firstKey);
+      }
     }
   }
 }
