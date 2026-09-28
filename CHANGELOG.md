@@ -14,6 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full public API export table added to README, listing every top-level export with its kind, source module, and a one-line description (closes #119).
 - Node.js 22 is the minimum supported runtime for the SDK; the package metadata, docs, and CI are aligned to the current toolchain requirements (closes #226).
 - Unit tests for `cancelWill` `refundAmount` correctness, including the primary (contract-returned value) and fallback (pre-call `getWill` balance) paths; the known race with a concurrent `topUp` is documented as a known limitation (closes #118).
+- `MIGRATION.md` added to the repository root: documents every breaking change to public interfaces with before/after examples and step-by-step migration instructions (closes #501).
+- `flushFeeStatsCache()` method on `SoroWillClient` for manually invalidating the per-network fee-stats cache (closes #500).
+
+### Changed
+
+- `getNetworkFeeStats()` now caches results per network passphrase rather than in a single global entry. If the connected wallet switches networks mid-session (e.g. Freighter toggled from testnet to mainnet), the cache is automatically flushed and fresh stats are fetched from the correct RPC endpoint (closes #500).
+- `Beneficiary` and `Will` interfaces in `src/types.ts` now carry JSDoc `@since` version tags and **Change history** tables so consumers can determine at a glance which SDK version introduced each field or breaking change (closes #501).
+- `WillStatus` enum members now carry `@since` tags indicating when each variant was introduced (closes #501).
+- `CONTRIBUTING.md` updated with guidance on documenting type changes: every breaking change to a public interface or enum must include a Change history table entry, `@since` tags on affected fields, a CHANGELOG entry, and a MIGRATION.md section (closes #501).
 
 ### Changed
 

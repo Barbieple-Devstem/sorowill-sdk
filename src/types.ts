@@ -93,57 +93,165 @@ export enum WillErrorCode {
  * the contract's internal basis-point representation (0-10,000, summing to
  * 10,000) when submitting a transaction, so a `percentage` of `30` is bound
  * on-chain as `3000` basis points.
+ *
+ * ## Change history
+ * | SDK version | Change |
+ * |-------------|--------|
+ * | 0.1.0       | Interface introduced with `address` and `percentage` fields. |
+ * | 0.1.1       | `percentage` scale clarified as 0-100 (not basis points); on-chain representation changed from raw `percentage` to `basis_points` (×100). Existing consumers storing percentages as basis points must divide by 100. |
+ *
+ * @since 0.1.0
  */
 export interface Beneficiary {
+  /**
+   * Stellar address of the beneficiary.
+   * @since 0.1.0
+   */
   address: string;
+  /**
+   * Share of the will's balance this beneficiary receives, expressed as a
+   * whole percentage on the 0–100 scale. All beneficiary percentages in a
+   * will must sum to exactly 100.
+   *
+   * **Breaking change in 0.1.1:** prior to 0.1.1 this field was named
+   * `basisPoints` and stored the raw on-chain value (0–10 000). It was
+   * renamed to `percentage` and re-scaled to 0–100 to match the SDK's
+   * public semantics. If you stored beneficiary objects from SDK < 0.1.1,
+   * divide each saved value by 100 to convert.
+   *
+   * @since 0.1.1
+   */
   percentage: number;
 }
 
-/** Lifecycle state of a will, mirroring `WillStatus` in the SoroWill contract. */
+/**
+ * Lifecycle state of a will, mirroring `WillStatus` in the SoroWill contract.
+ *
+ * ## Change history
+ * | SDK version | Change |
+ * |-------------|--------|
+ * | 0.1.0       | Enum introduced with `Active`, `Triggered`, `Released`, `Cancelled`. |
+ * | 0.1.1       | `PendingConfirmation` and `Settled` states added to reflect new contract lifecycle stages. Any exhaustive switch/if-chain over `WillStatus` values **must** handle these new variants. |
+ *
+ * @since 0.1.0
+ */
 export enum WillStatus {
-  /** The will has been created but is not yet fully confirmed on-chain (e.g. awaiting initial deposit settlement). */
+  /**
+   * The will has been created but is not yet fully confirmed on-chain
+   * (e.g. awaiting initial deposit settlement).
+   * @since 0.1.1
+   */
   PendingConfirmation = 'PendingConfirmation',
-  /** The will is funded and the owner is checking in on schedule. */
+  /**
+   * The will is funded and the owner is checking in on schedule.
+   * @since 0.1.0
+   */
   Active = 'Active',
-  /** The owner missed a check-in deadline; the grace period is running. */
+  /**
+   * The owner missed a check-in deadline; the grace period is running.
+   * @since 0.1.0
+   */
   Triggered = 'Triggered',
-  /** The grace period expired (or guardians reached quorum) and funds were released. */
+  /**
+   * The grace period expired (or guardians reached quorum) and funds were released.
+   * @since 0.1.0
+   */
   Released = 'Released',
-  /** The owner cancelled the will and withdrew the remaining balance. */
+  /**
+   * The owner cancelled the will and withdrew the remaining balance.
+   * @since 0.1.0
+   */
   Cancelled = 'Cancelled',
-  /** The will has been fully settled: all balances distributed and the record is closed. */
+  /**
+   * The will has been fully settled: all balances distributed and the record is closed.
+   * @since 0.1.1
+   */
   Settled = 'Settled',
 }
 
-/** The full on-chain state of a single will, decoded into native JS types. */
+/**
+ * The full on-chain state of a single will, decoded into native JS types.
+ *
+ * ## Change history
+ * | SDK version | Change |
+ * |-------------|--------|
+ * | 0.1.0       | Interface introduced. Fields: `id`, `owner`, `token`, `balance`, `beneficiaries`, `checkinPeriodDays`, `gracePeriodDays`, `lastCheckin`, `triggerTime`, `status`, `guardians`, `guardianVotes`. |
+ * | 0.1.1       | `beneficiaries[].percentage` changed from raw basis points (0–10 000) to a 0–100 percentage scale. **Breaking**: stored beneficiary values from SDK ≤ 0.1.0 must be divided by 100. `status` gains two new variants: `PendingConfirmation` and `Settled` — exhaustive switch statements must handle them. |
+ *
+ * @see {@link Beneficiary} for the beneficiary scale change details.
+ * @see {@link WillStatus} for the new status variants.
+ * @since 0.1.0
+ */
 export interface Will {
-  /** Unique identifier for this will, as a decimal string (contract-side `u64`). */
+  /**
+   * Unique identifier for this will, as a decimal string (contract-side `u64`).
+   * @since 0.1.0
+   */
   id: string;
-  /** The address that created and funds the will. */
+  /**
+   * The address that created and funds the will.
+   * @since 0.1.0
+   */
   owner: string;
-  /** The token contract address (e.g. a USDC Stellar Asset Contract) held by the will. */
+  /**
+   * The token contract address (e.g. a USDC Stellar Asset Contract) held by the will.
+   * @since 0.1.0
+   */
   token: string;
-  /** The amount of `token` currently locked, in base units, as a decimal string. */
+  /**
+   * The amount of `token` currently locked, in base units, as a decimal string.
+   * @since 0.1.0
+   */
   balance: string;
   /**
    * The beneficiaries and their percentage shares (0-100 scale). Always sums
    * to 100. On-chain these are stored as basis points summing to 10,000; the
    * SDK exposes them on the 0-100 `percentage` scale.
+   *
+   * **Breaking change in 0.1.1:** prior to 0.1.1 each entry's `percentage`
+   * was stored as raw basis points (0–10 000). Divide stored values by 100 to
+   * migrate.
+   * @since 0.1.0
    */
   beneficiaries: Beneficiary[];
-  /** How many days the owner may go without checking in before the will can be triggered. */
+  /**
+   * How many days the owner may go without checking in before the will can be triggered.
+   * @since 0.1.0
+   */
   checkinPeriodDays: number;
-  /** How many days after being triggered the owner has to prove they are alive. */
+  /**
+   * How many days after being triggered the owner has to prove they are alive.
+   * @since 0.1.0
+   */
   gracePeriodDays: number;
-  /** When the owner last checked in. */
+  /**
+   * When the owner last checked in.
+   * @since 0.1.0
+   */
   lastCheckin: Date;
-  /** When the will was triggered, or `null` if it has never been triggered. */
+  /**
+   * When the will was triggered, or `null` if it has never been triggered.
+   * @since 0.1.0
+   */
   triggerTime: Date | null;
-  /** Current lifecycle state of the will. */
+  /**
+   * Current lifecycle state of the will.
+   *
+   * **Breaking change in 0.1.1:** two new variants were added —
+   * `PendingConfirmation` and `Settled`. If your code uses an exhaustive
+   * switch/if-chain over `WillStatus`, add handling for these new values.
+   * @since 0.1.0
+   */
   status: WillStatus;
-  /** Optional guardian addresses (up to 3) who may force an early release. */
+  /**
+   * Optional guardian addresses (up to 3) who may force an early release.
+   * @since 0.1.0
+   */
   guardians: string[];
-  /** Number of distinct guardians who have voted in the current release cycle. */
+  /**
+   * Number of distinct guardians who have voted in the current release cycle.
+   * @since 0.1.0
+   */
   guardianVotes: number;
 }
 

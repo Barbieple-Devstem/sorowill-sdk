@@ -81,6 +81,64 @@ must be enabled in the repository settings with the source set to the `gh-pages`
 deployed, the reference is reachable at
 `https://sorowill.github.io/sorowill-sdk/`.
 
+## Documenting type changes (issue #501)
+
+When the SoroWill contract is upgraded and a public interface or enum in
+`src/types.ts` must change, follow these steps so consumers can upgrade safely:
+
+### 1. Add a `@since` tag to every new or changed field
+
+```ts
+export interface Will {
+  /**
+   * New field added in 0.2.0.
+   * @since 0.2.0
+   */
+  newField: string;
+}
+```
+
+### 2. Add a Change history table to the interface/enum JSDoc
+
+```ts
+/**
+ * The full on-chain state of a will.
+ *
+ * ## Change history
+ * | SDK version | Change |
+ * |-------------|--------|
+ * | 0.1.0       | Interface introduced. |
+ * | 0.2.0       | `newField` added. **Breaking**: existing serialised `Will` objects will not have this field; consumers must handle `undefined` until data is refreshed from the RPC. |
+ */
+export interface Will { ... }
+```
+
+### 3. Add a CHANGELOG entry
+
+Under `[Unreleased] → ### Changed` (for breaking changes) or `### Added`
+(for purely additive changes):
+
+```md
+- `Will` interface: `newField` added (contract upgrade v2). **Breaking** for
+  consumers that store serialised `Will` objects — see MIGRATION.md (closes #NNN).
+```
+
+### 4. Add a migration section to MIGRATION.md
+
+For every breaking change, add a versioned section to `MIGRATION.md` that
+explains:
+- What changed and why.
+- A before/after table.
+- Concrete code snippets showing how to update call sites and any persisted data.
+
+### 5. Verify
+
+Run `npm run typecheck` and `npm test` to make sure no existing code silently
+breaks. If `WillStatus` gains a new variant, TypeScript's exhaustiveness
+checking will surface any unhandled `switch` branches in the codebase.
+
+---
+
 ## ScVal / XDR snapshot tests
 
 Every state-changing method encodes its arguments into Soroban `ScVal`s via
