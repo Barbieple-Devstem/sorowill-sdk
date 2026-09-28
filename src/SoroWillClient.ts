@@ -186,6 +186,25 @@ export interface SoroWillClientOptions {
   /** Advanced override for testing or custom transports. */
   rpcServer?: SoroWillRpcServer;
   /**
+   * Optional shared in-flight deduplication tracker.
+   *
+   * By default each `SoroWillClient` instance creates its own `InFlightTracker`
+   * scoped to its `contractId`, so duplicate requests from *different* instances
+   * are not deduplicated. Pass a shared `InFlightTracker` (constructed with the
+   * same `contractId` as the clients) to enable cross-instance deduplication
+   * for the same contract (#503).
+   *
+   * @example
+   * ```ts
+   * import { InFlightTracker, SoroWillClient } from '@sorowill/sdk';
+   *
+   * const tracker = new InFlightTracker('CA3D5KRY...');
+   * const clientA = new SoroWillClient({ ..., inFlightTracker: tracker });
+   * const clientB = new SoroWillClient({ ..., inFlightTracker: tracker });
+   * ```
+   */
+  inFlightTracker?: InFlightTracker;
+  /**
    * Advanced override for testing or preloaded contract specs.
    *
    * By injecting a pre-built spec you can write snapshot tests that lock in
@@ -710,7 +729,12 @@ export class SoroWillClient {
         ? {}
         : { requestsPerSecond: options.requestsPerSecond }),
     });
-    this.inFlightTracker = new InFlightTracker();
+    this.inFlightTracker =
+      options.inFlightTracker ??
+      // Default: a private tracker scoped to this contract's address so that
+      // different client instances targeting different contracts never share a
+      // dedup entry for the same (willId, method) pair (#503).
+      new InFlightTracker(options.contractId);
     this.readCache = options.readCache === false ? undefined : new ReadCache(options.readCache);
     this.retryOptions = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
     const { maxAttempts, initialDelayMs, maxDelayMs, backoffFactor } = this.retryOptions;

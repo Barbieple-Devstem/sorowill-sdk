@@ -84,6 +84,8 @@ export type {
 export { ReadCache } from './cache';
 export type { ReadCacheOptions } from './cache';
 
+export { InFlightTracker } from './inFlightTracker';
+
 export { unsubscribeFromWillEvents } from './events';
 export type {
   WillEvent,

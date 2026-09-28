@@ -399,6 +399,7 @@ For applications that need custom signing logic (e.g. multi-sig, custom key deri
 | Export | Kind | Source module | Description |
 |---|---|---|---|
 | `RequestQueue` | class | `requestQueue` | FIFO queue with concurrency and rate-limit controls used internally by the client |
+| `InFlightTracker` | class | `inFlightTracker` | Deduplicates concurrent identical in-flight operations; can be shared across `SoroWillClient` instances targeting the same contract to prevent duplicate RPC calls (#503) |
 
 ### Events
 
