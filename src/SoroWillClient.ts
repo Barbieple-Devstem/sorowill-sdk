@@ -326,6 +326,12 @@ export interface SoroWillClientOptions {
   maxConcurrentRequests?: number;
   /** Maximum RPC requests started in a rolling one-second window. Defaults to 10. */
   requestsPerSecond?: number;
+  /**
+   * Maximum number of concurrent state-changing operations a single wallet
+   * address may have in flight through this client's tracker. Defaults to 10.
+   * Ignored when a custom `inFlightTracker` is supplied (configure it there).
+   */
+  maxConcurrentPerWallet?: number;
   /** Optional list of RPC endpoints to use with automatic failover. */
   rpcUrls?: string[];
   /**
@@ -764,7 +770,12 @@ export class SoroWillClient {
       // Default: a private tracker scoped to this contract's address so that
       // different client instances targeting different contracts never share a
       // dedup entry for the same (willId, method) pair (#503).
-      new InFlightTracker(options.contractId);
+      new InFlightTracker({
+        scopeId: options.contractId,
+        ...(options.maxConcurrentPerWallet === undefined
+          ? {}
+          : { maxConcurrentPerWallet: options.maxConcurrentPerWallet }),
+      });
     this.readCache = options.readCache === false ? undefined : new ReadCache(options.readCache);
     this.retryOptions = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
     const { maxAttempts, initialDelayMs, maxDelayMs, backoffFactor } = this.retryOptions;
@@ -2033,9 +2044,14 @@ export class SoroWillClient {
     }
     };
 
-    return willId === undefined
-      ? run()
-      : this.inFlightTracker.track(willId, method, run) as Promise<{
+    if (willId === undefined) {
+      return run();
+    }
+    // Resolve the signing wallet so the tracker can enforce per-wallet
+    // concurrency limits (#606). A wallet that cannot report its key is not
+    // counted here; submit() surfaces the underlying wallet error itself.
+    const walletAddress = await this.getWalletPublicKey().catch(() => undefined);
+    return this.inFlightTracker.track(willId, method, run, undefined, walletAddress) as Promise<{
           txHash: string;
           createdAt: number;
           returnValue: ScVal | undefined;

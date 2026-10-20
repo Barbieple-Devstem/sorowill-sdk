@@ -205,6 +205,13 @@ export {
 } from './requestQueue';
 export type { RequestQueueOptions } from './requestQueue';
 
+export {
+  InFlightTracker,
+  WalletConcurrencyLimitError,
+  globalInFlightTracker,
+} from './inFlightTracker';
+export type { InFlightTrackerOptions } from './inFlightTracker';
+
 export { buildSep7TxUri, parseSep7Callback } from './sep7';
 export type { BuildSep7TxUriOptions, Sep7CallbackResult } from './sep7';
 

@@ -1,3 +1,5 @@
+import { SoroWillError } from './errors';
+
 type OperationKey = string;
 type OperationResult<T> = Promise<T>;
 
@@ -6,6 +8,26 @@ interface InFlightOperation<T> {
   controller: AbortController;
   /** Wall-clock ms when this entry was added. Used for TTL eviction (issue #487). */
   createdAt: number;
+  /** Wallet address that owns this operation, used for per-wallet limits (issue #606). */
+  wallet: string | undefined;
+  /** True once this entry's per-wallet slot has been returned. */
+  released: boolean;
+}
+
+/** Configuration for {@link InFlightTracker}. */
+export interface InFlightTrackerOptions {
+  /** Scope prepended to every key, typically the contract id (#503). */
+  scopeId?: string;
+  /** Maximum number of tracked operations across all wallets. Defaults to 100. */
+  maxInFlight?: number;
+  /** Entry time-to-live in milliseconds. Defaults to 120 000. */
+  ttlMs?: number;
+  /**
+   * Maximum number of concurrent operations a single wallet address may have
+   * in flight. Further operations for that wallet are rejected with
+   * {@link WalletConcurrencyLimitError} until one settles. Defaults to 10.
+   */
+  maxConcurrentPerWallet?: number;
 }
 
 interface FailedOperation {
@@ -16,6 +38,23 @@ interface FailedOperation {
 const FAILED_SEQUENCE_TTL_MS = 60_000;
 const DEFAULT_MAX_IN_FLIGHT = 100;
 const DEFAULT_TTL_MS = 120_000;
+const DEFAULT_MAX_CONCURRENT_PER_WALLET = 10;
+
+/** Thrown when a wallet already has the maximum number of concurrent operations in flight. */
+export class WalletConcurrencyLimitError extends SoroWillError {
+  readonly walletAddress: string;
+  readonly limit: number;
+
+  constructor(walletAddress: string, limit: number) {
+    super(
+      `Wallet ${walletAddress} already has ${limit} concurrent operation${limit === 1 ? '' : 's'} ` +
+        'in flight; wait for one to settle before starting another.',
+    );
+    this.name = 'WalletConcurrencyLimitError';
+    this.walletAddress = walletAddress;
+    this.limit = limit;
+  }
+}
 
 /**
  * Shared, process-wide tracker used to deduplicate identical concurrent
@@ -34,8 +73,29 @@ export class InFlightTracker {
   private readonly maxInFlight: number;
   private readonly ttlMs: number;
   private readonly scopeId: string | undefined;
+  private readonly maxConcurrentPerWallet: number;
+  private readonly walletCounts = new Map<string, number>();
 
-  constructor(scopeIdOrMaxInFlight?: string | number, ttlMs: number = DEFAULT_TTL_MS) {
+  constructor(
+    scopeIdOrMaxInFlight?: string | number | InFlightTrackerOptions,
+    ttlMs: number = DEFAULT_TTL_MS,
+  ) {
+    if (typeof scopeIdOrMaxInFlight === 'object' && scopeIdOrMaxInFlight !== null) {
+      const options = scopeIdOrMaxInFlight;
+      this.scopeId = options.scopeId;
+      this.maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
+      this.ttlMs = options.ttlMs ?? ttlMs;
+      this.maxConcurrentPerWallet =
+        options.maxConcurrentPerWallet ?? DEFAULT_MAX_CONCURRENT_PER_WALLET;
+      if (
+        this.maxConcurrentPerWallet !== Infinity &&
+        (!Number.isInteger(this.maxConcurrentPerWallet) || this.maxConcurrentPerWallet < 1)
+      ) {
+        throw new RangeError('maxConcurrentPerWallet must be a positive integer or Infinity');
+      }
+      return;
+    }
+    this.maxConcurrentPerWallet = DEFAULT_MAX_CONCURRENT_PER_WALLET;
     if (typeof scopeIdOrMaxInFlight === 'string') {
       // Called with scopeId
       this.scopeId = scopeIdOrMaxInFlight;
@@ -143,6 +203,7 @@ export class InFlightTracker {
     method: string,
     operation: (signal: AbortSignal) => PromiseLike<T>,
     clientId?: string,
+    walletAddress?: string,
   ): Promise<T> {
     const key = this.getKey(willId, method, clientId);
 
@@ -157,13 +218,29 @@ export class InFlightTracker {
 
     // Prune expired entries and enforce the size cap before adding a new one.
     this.pruneExpired();
+
+    // Per-wallet limit (#606): a deduplicated call above shares the existing
+    // slot, so only genuinely new operations count against the wallet.
+    if (walletAddress !== undefined && this.getWalletInFlightCount(walletAddress) >= this.maxConcurrentPerWallet) {
+      return Promise.reject(new WalletConcurrencyLimitError(walletAddress, this.maxConcurrentPerWallet));
+    }
+
     if (this.inFlight.size >= this.maxInFlight) {
       this.evictOldest();
     }
 
     const controller = new AbortController();
-    const entry = { controller, createdAt: Date.now() } as InFlightOperation<T>;
+    const entry = {
+      controller,
+      createdAt: Date.now(),
+      wallet: walletAddress,
+      released: false,
+    } as InFlightOperation<T>;
+    if (walletAddress !== undefined) {
+      this.walletCounts.set(walletAddress, this.getWalletInFlightCount(walletAddress) + 1);
+    }
     entry.promise = Promise.resolve(operation(controller.signal)).finally(() => {
+      this.releaseWallet(entry as InFlightOperation<unknown>);
       // Only remove the entry this call created; a newer track() may own the key now.
       if (this.inFlight.get(key) === entry) {
         this.inFlight.delete(key);
@@ -197,11 +274,13 @@ export class InFlightTracker {
   }
 
   clear(): void {
-    for (const { controller } of this.inFlight.values()) {
-      controller.abort();
+    for (const op of this.inFlight.values()) {
+      op.controller.abort();
+      this.releaseWallet(op);
     }
     this.inFlight.clear();
     this.failedSequences.clear();
+    this.walletCounts.clear();
   }
 
   abort(willId: string | bigint, method: string, clientId?: string): void {
@@ -209,6 +288,7 @@ export class InFlightTracker {
     const op = this.inFlight.get(key);
     if (op) {
       op.controller.abort();
+      this.releaseWallet(op);
       this.inFlight.delete(key);
     }
   }
@@ -221,6 +301,16 @@ export class InFlightTracker {
     return this.inFlight.size;
   }
 
+  /** Returns the number of operations currently in flight for `walletAddress`. */
+  getWalletInFlightCount(walletAddress: string): number {
+    return this.walletCounts.get(walletAddress) ?? 0;
+  }
+
+  /** Returns the configured maximum number of concurrent operations per wallet. */
+  get walletLimit(): number {
+    return this.maxConcurrentPerWallet;
+  }
+
   // ─── Private helpers ────────────────────────────────────────────────────
 
   private isExpired(op: InFlightOperation<unknown>): boolean {
@@ -229,7 +319,20 @@ export class InFlightTracker {
 
   private evict(key: OperationKey, op: InFlightOperation<unknown>): void {
     op.controller.abort();
+    this.releaseWallet(op);
     this.inFlight.delete(key);
+  }
+
+  /** Returns an entry's per-wallet slot exactly once. */
+  private releaseWallet(op: InFlightOperation<unknown>): void {
+    if (op.released || op.wallet === undefined) return;
+    op.released = true;
+    const remaining = this.getWalletInFlightCount(op.wallet) - 1;
+    if (remaining > 0) {
+      this.walletCounts.set(op.wallet, remaining);
+    } else {
+      this.walletCounts.delete(op.wallet);
+    }
   }
 
   /** Removes all entries whose TTL has elapsed. */
@@ -238,6 +341,7 @@ export class InFlightTracker {
     for (const [key, op] of this.inFlight) {
       if (now - op.createdAt > this.ttlMs) {
         op.controller.abort();
+        this.releaseWallet(op);
         this.inFlight.delete(key);
       }
     }
@@ -255,6 +359,7 @@ export class InFlightTracker {
       const op = this.inFlight.get(firstKey);
       if (op) {
         op.controller.abort();
+        this.releaseWallet(op);
         this.inFlight.delete(firstKey);
       }
     }
