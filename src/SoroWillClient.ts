@@ -408,6 +408,38 @@ const DEFAULT_RETRY_OPTIONS: RpcRetryOptions = {
  * corrupted `Will`: verifies the value decoded by `funcResToNative` actually
  * has the shape this SDK expects before any of its fields are trusted.
  */
+/**
+ * Settles with `promise`, or rejects with the signal's abort reason as soon as
+ * `signal` fires — whichever happens first. Lets callers stop waiting on a
+ * long-running step (wallet signing, an in-flight RPC) the moment they abort
+ * instead of waiting for it to time out (#608).
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    // The original promise is abandoned; keep its eventual rejection handled.
+    promise.catch(() => undefined);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      promise.catch(() => undefined);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 function isRawWillShape(value: unknown): value is RawWill {
   if (typeof value !== 'object' || value === null) {
     return false;
@@ -1827,6 +1859,26 @@ export class SoroWillClient {
     return subscription;
   }
 
+  /**
+   * Cancels an in-flight state-changing operation started by this client for
+   * `willId`, identified by its contract method name (e.g. `'check_in'`,
+   * `'top_up'`). The pending call rejects with an `AbortError` and its
+   * afterInvoke hooks still run, so callers do not have to wait for the
+   * request timeout (#608).
+   *
+   * To cancel a single call you started yourself, prefer passing an
+   * `AbortSignal` via `options.signal` and aborting its controller.
+   *
+   * @returns `true` if an operation was in flight and has been cancelled.
+   */
+  cancelOperation(willId: string, method: string): boolean {
+    if (!this.inFlightTracker.isInFlight(willId, method)) {
+      return false;
+    }
+    this.inFlightTracker.abort(willId, method);
+    return true;
+  }
+
   /** Tears down the client: unsubscribes from any event source, aborts all
    * in-flight tracked operations, and rejects every queued-but-not-yet-started
    * request so nothing continues running in the background after teardown. */
@@ -1961,8 +2013,9 @@ export class SoroWillClient {
     args: Record<string, unknown>,
     options?: RequestOptions,
   ): Promise<{ txHash: string; createdAt: number; returnValue: ScVal | undefined; events?: Array<{ topics: string[]; data: unknown }> }> {
+    options?.signal?.throwIfAborted();
     const willId = args.will_id === undefined ? undefined : String(args.will_id);
-    const run = async (): Promise<{
+    const execute = async (options: RequestOptions | undefined): Promise<{
       txHash: string;
       createdAt: number;
       returnValue: ScVal | undefined;
@@ -2045,6 +2098,25 @@ export class SoroWillClient {
         }
       }
     }
+    };
+
+    // Combine the caller's signal with the tracker's per-operation signal so
+    // the operation stops both when the caller aborts and when it is cancelled
+    // via cancelOperation()/destroy() (#608). The abort settles the returned
+    // promise immediately; execute() unwinds through its own abort checkpoints
+    // and still runs afterInvoke hooks for graceful cleanup.
+    const run = (trackerSignal?: AbortSignal): Promise<{
+      txHash: string;
+      createdAt: number;
+      returnValue: ScVal | undefined;
+      events?: Array<{ topics: string[]; data: unknown }>;
+    }> => {
+      const signals = [options?.signal, trackerSignal].filter(
+        (signal): signal is AbortSignal => signal !== undefined,
+      );
+      const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+      const runOptions = signal === undefined ? options : { ...options, signal };
+      return raceAbort(execute(runOptions), signal);
     };
 
     if (willId === undefined) {
@@ -2133,9 +2205,15 @@ export class SoroWillClient {
       );
       this.debugLogger.logSimulation(label, undefined, prepared.fee);
 
-      const signedTxResponse = await this.wallet.signTransaction(prepared.toXDR(), {
-        networkPassphrase: this.networkPassphrase,
-      });
+      const signedTxResponse = await raceAbort(
+        Promise.resolve(
+          this.wallet.signTransaction(prepared.toXDR(), {
+            networkPassphrase: this.networkPassphrase,
+          }),
+        ),
+        options?.signal,
+      );
+      options?.signal?.throwIfAborted();
       const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
       const signedTx = TransactionBuilder.fromXDR(
         signedTxXdr,
@@ -2499,7 +2577,10 @@ export class SoroWillClient {
   /** Sends every RPC through the shared FIFO queue with the selected timeout. */
   private rpc<T>(request: () => Promise<T>, options?: RequestOptions): Promise<T> {
     options?.signal?.throwIfAborted();
-    return this.queue.enqueue(request, options?.timeoutMs ?? this.timeoutMs, options?.signal);
+    return raceAbort(
+      this.queue.enqueue(request, options?.timeoutMs ?? this.timeoutMs, options?.signal),
+      options?.signal,
+    );
   }
 
   /**
