@@ -68,7 +68,10 @@ import { RpcEndpointPool } from './rpc';
 import { buildSep7TxUri, type BuildSep7TxUriOptions } from './sep7';
 import { HookManager } from './hooks';
 import type { BeforeInvokeContext, AfterInvokeContext } from './hooks';
-import { assertPreparedTransactionMatchesIntendedOperation } from './txValidation';
+import {
+  assertPreparedTransactionMatchesIntendedOperation,
+  assertSupportedSignatureAlgorithm,
+} from './txValidation';
 import { DebugLogger } from './debugLogger';
 
 /** @internal Local alias for Soroban's `xdr.ScVal`; not part of the public API. */
@@ -2143,6 +2146,7 @@ export class SoroWillClient {
           'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
         );
       }
+      assertSupportedSignatureAlgorithm(signedTx, { context: label });
 
       options?.signal?.throwIfAborted();
       // Failover only retries connection-level errors (see RpcEndpointPool). Re-sending the
@@ -2217,6 +2221,7 @@ export class SoroWillClient {
               'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
             );
           }
+          assertSupportedSignatureAlgorithm(feeBumpSignedTx, { context: `${label} (fee bump)` });
 
           const feeBumpResponse = await this.rpc(
             () => this.rpcPool.withFailover((server) => server.sendTransaction(feeBumpSignedTx)),
@@ -2324,6 +2329,7 @@ export class SoroWillClient {
         'Expected a plain Transaction envelope after signing, but received FeeBumpTransaction',
       );
     }
+    assertSupportedSignatureAlgorithm(signedTx, { context: 'submitSignedTransaction' });
     const publicKey = await this.getWalletPublicKey();
     await this.rpc(
       () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),

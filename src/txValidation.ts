@@ -1,4 +1,4 @@
-import { TransactionBuilder, xdr } from '@stellar/stellar-sdk';
+import { Keypair, TransactionBuilder, xdr } from '@stellar/stellar-sdk';
 
 export interface TransactionMatchOptions {
   intendedTransactionXdr: string;
@@ -217,4 +217,119 @@ export function assertPreparedTransactionMatchesIntendedOperation(
       );
     }
   }
+}
+
+/** Length in bytes of an Ed25519 signature, the only algorithm Stellar accepts for account signers. */
+export const ED25519_SIGNATURE_LENGTH = 64;
+/** Length in bytes of a Stellar signature hint (the last 4 bytes of the signer's Ed25519 public key). */
+export const SIGNATURE_HINT_LENGTH = 4;
+
+/**
+ * Raised when a transaction carries a signature that is not a well-formed
+ * Ed25519 signature, or one that does not verify against an expected signer.
+ */
+export class UnsupportedSignatureAlgorithmError extends Error {
+  /** Index of the offending signature within the envelope. */
+  readonly signatureIndex: number;
+
+  constructor(context: string, signatureIndex: number, reason: string) {
+    super(`Signature ${signatureIndex} on ${context} was rejected: ${reason}`);
+    this.name = 'UnsupportedSignatureAlgorithmError';
+    this.signatureIndex = signatureIndex;
+  }
+}
+
+export interface SignatureValidationOptions {
+  /** Human-readable label used in error messages. */
+  context: string;
+  /**
+   * Public keys (G...) expected to have signed the transaction. When given,
+   * every signature must carry the hint of one of these keys and verify as a
+   * valid Ed25519 signature over the transaction hash.
+   */
+  expectedSigners?: readonly string[];
+}
+
+/** Minimal transaction shape needed for signature validation. */
+export interface SignedTransactionLike {
+  signatures?: readonly xdr.DecoratedSignature[];
+  hash?: () => Buffer;
+}
+
+function toBytes(value: unknown): Uint8Array | undefined {
+  return value instanceof Uint8Array ? value : undefined;
+}
+
+/**
+ * Ensures every signature on `transaction` uses the Ed25519 algorithm.
+ *
+ * Stellar account signatures are always 64-byte Ed25519 signatures paired
+ * with a 4-byte hint. Anything else (truncated, padded, or produced by a
+ * different algorithm such as secp256k1/ECDSA) is rejected before submission.
+ * When `expectedSigners` is supplied, each signature is additionally verified
+ * cryptographically against the matching signer's public key.
+ *
+ * @throws {UnsupportedSignatureAlgorithmError} On the first invalid signature.
+ */
+export function assertSupportedSignatureAlgorithm(
+  transaction: SignedTransactionLike,
+  options: SignatureValidationOptions,
+): void {
+  const signatures = transaction.signatures ?? [];
+  const signers = (options.expectedSigners ?? []).map((publicKey) => Keypair.fromPublicKey(publicKey));
+  const txHash = signers.length > 0 ? transaction.hash?.() : undefined;
+
+  signatures.forEach((decorated, index) => {
+    const signature = toBytes(decorated.signature());
+    const hint = toBytes(decorated.hint());
+
+    if (!signature || signature.length !== ED25519_SIGNATURE_LENGTH) {
+      throw new UnsupportedSignatureAlgorithmError(
+        options.context,
+        index,
+        `expected a ${ED25519_SIGNATURE_LENGTH}-byte Ed25519 signature, got ${signature?.length ?? 0} bytes`,
+      );
+    }
+    if (!hint || hint.length !== SIGNATURE_HINT_LENGTH) {
+      throw new UnsupportedSignatureAlgorithmError(
+        options.context,
+        index,
+        `expected a ${SIGNATURE_HINT_LENGTH}-byte Ed25519 signature hint`,
+      );
+    }
+
+    if (signers.length === 0) return;
+
+    const hintHex = Buffer.from(hint).toString('hex');
+    const signer = signers.find(
+      (candidate) => candidate.signatureHint().toString('hex') === hintHex,
+    );
+    if (!signer) {
+      throw new UnsupportedSignatureAlgorithmError(
+        options.context,
+        index,
+        'signature hint does not match any expected Ed25519 signer',
+      );
+    }
+    if (!txHash || !signer.verify(txHash, Buffer.from(signature))) {
+      throw new UnsupportedSignatureAlgorithmError(
+        options.context,
+        index,
+        'signature is not a valid Ed25519 signature from the expected signer',
+      );
+    }
+  });
+}
+
+/**
+ * Decodes `signedTransactionXdr` and applies {@link assertSupportedSignatureAlgorithm}
+ * to it (to the outer envelope for fee-bump transactions).
+ */
+export function assertSignedTransactionXdrSignatures(
+  signedTransactionXdr: string,
+  networkPassphrase: string,
+  options: SignatureValidationOptions,
+): void {
+  const transaction = TransactionBuilder.fromXDR(signedTransactionXdr, networkPassphrase);
+  assertSupportedSignatureAlgorithm(transaction as unknown as SignedTransactionLike, options);
 }
