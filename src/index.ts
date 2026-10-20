@@ -199,6 +199,9 @@ export {
   RequestPriority,
   getSharedRequestQueue,
   releaseSharedRequestQueue,
+  computeBackoffDelay,
+  isRateLimitError,
+  MAX_BACKOFF_MS,
 } from './requestQueue';
 export type { RequestQueueOptions } from './requestQueue';
 

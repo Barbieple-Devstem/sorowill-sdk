@@ -26,6 +26,60 @@ export interface RequestQueueOptions {
    * queues) are created for that account in rapid succession.
    */
   account?: string;
+  /**
+   * Maximum number of times a request that fails with a rate-limit error
+   * (HTTP 429 / "too many requests") is retried before the error is surfaced.
+   * Defaults to 3. Set to 0 to disable rate-limit retries.
+   */
+  maxRateLimitRetries?: number;
+  /**
+   * Base delay in milliseconds for rate-limit retries. The n-th retry waits
+   * `2^n * retryBaseDelayMs` (capped by {@link maxBackoffMs}). Defaults to 500.
+   */
+  retryBaseDelayMs?: number;
+  /** Upper bound in milliseconds for a single backoff delay. Defaults to 60 000 (60s). */
+  maxBackoffMs?: number;
+}
+
+/** Default cap applied to a single exponential backoff delay (60 seconds). */
+export const MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Computes the exponential backoff delay for a retry: `2^attempt * baseDelayMs`,
+ * capped at `maxBackoffMs`. `attempt` is zero-based (the first retry is attempt 0).
+ */
+export function computeBackoffDelay(
+  attempt: number,
+  baseDelayMs: number,
+  maxBackoffMs: number = MAX_BACKOFF_MS,
+): number {
+  const delay = 2 ** attempt * baseDelayMs;
+  return Number.isFinite(delay) ? Math.min(delay, maxBackoffMs) : maxBackoffMs;
+}
+
+/**
+ * Returns true when `error` signals that the RPC endpoint rate-limited the
+ * request (HTTP 429 or a "too many requests" / "rate limit" message).
+ */
+export function isRateLimitError(error: unknown): boolean {
+  if (error === null || error === undefined) return false;
+  if (typeof error === 'object') {
+    const candidate = error as {
+      status?: unknown;
+      statusCode?: unknown;
+      response?: { status?: unknown };
+    };
+    if (
+      candidate.status === 429 ||
+      candidate.statusCode === 429 ||
+      candidate.response?.status === 429
+    ) {
+      return true;
+    }
+  }
+  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  const lower = text.toLowerCase();
+  return lower.includes('too many requests') || lower.includes('rate limit') || /\b429\b/.test(text);
 }
 
 /** Priority level for requests in the queue. Higher priority requests are processed first within FIFO ordering constraints. */
@@ -57,15 +111,27 @@ interface PendingRequest<T> {
 class QueueCore {
   readonly maxConcurrent: number;
   readonly requestsPerSecond: number;
+  readonly maxRateLimitRetries: number;
+  readonly retryBaseDelayMs: number;
+  readonly maxBackoffMs: number;
   readonly pending: Array<PendingRequest<unknown>> = [];
   readonly starts: number[] = [];
   active = 0;
   wakeTimer: ReturnType<typeof setTimeout> | undefined;
   refCount = 0;
 
-  constructor(maxConcurrent: number, requestsPerSecond: number) {
+  constructor(
+    maxConcurrent: number,
+    requestsPerSecond: number,
+    maxRateLimitRetries: number,
+    retryBaseDelayMs: number,
+    maxBackoffMs: number,
+  ) {
     this.maxConcurrent = maxConcurrent;
     this.requestsPerSecond = requestsPerSecond;
+    this.maxRateLimitRetries = maxRateLimitRetries;
+    this.retryBaseDelayMs = retryBaseDelayMs;
+    this.maxBackoffMs = maxBackoffMs;
   }
 }
 
@@ -92,17 +158,29 @@ export class RequestQueue {
     if (!Number.isInteger(requestsPerSecond) || requestsPerSecond < 1) {
       throw new RangeError('requestsPerSecond must be a positive integer');
     }
+    const maxRateLimitRetries = options.maxRateLimitRetries ?? 3;
+    const retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
+    const maxBackoffMs = options.maxBackoffMs ?? MAX_BACKOFF_MS;
+    if (!Number.isInteger(maxRateLimitRetries) || maxRateLimitRetries < 0) {
+      throw new RangeError('maxRateLimitRetries must be a non-negative integer');
+    }
+    if (!Number.isFinite(retryBaseDelayMs) || retryBaseDelayMs < 0) {
+      throw new RangeError('retryBaseDelayMs must be a finite, non-negative number');
+    }
+    if (!Number.isFinite(maxBackoffMs) || maxBackoffMs < 0 || maxBackoffMs > MAX_BACKOFF_MS) {
+      throw new RangeError(`maxBackoffMs must be between 0 and ${MAX_BACKOFF_MS}`);
+    }
     this.account = options.account;
     if (this.account !== undefined) {
       let core = sharedCores.get(this.account);
       if (core === undefined) {
-        core = new QueueCore(maxConcurrent, requestsPerSecond);
+        core = new QueueCore(maxConcurrent, requestsPerSecond, maxRateLimitRetries, retryBaseDelayMs, maxBackoffMs);
         sharedCores.set(this.account, core);
       }
       core.refCount += 1;
       this.core = core;
     } else {
-      this.core = new QueueCore(maxConcurrent, requestsPerSecond);
+      this.core = new QueueCore(maxConcurrent, requestsPerSecond, maxRateLimitRetries, retryBaseDelayMs, maxBackoffMs);
     }
   }
 
@@ -223,29 +301,67 @@ export class RequestQueue {
   }
 
   private async execute<T>(request: PendingRequest<T>): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const result =
-        request.timeoutMs === undefined
-          ? await request.run()
-          : await Promise.race([
-              request.run(),
-              new Promise<never>((_, reject) => {
-                timer = setTimeout(
-                  () => reject(new RequestTimeoutError(request.timeoutMs as number)),
-                  request.timeoutMs,
-                );
-              }),
-            ]);
-      request.resolve(result);
+      let attempt = 0;
+      for (;;) {
+        try {
+          request.resolve(await this.runAttempt(request));
+          return;
+        } catch (error) {
+          if (!isRateLimitError(error) || attempt >= this.core.maxRateLimitRetries) {
+            throw error;
+          }
+          // Back off exponentially instead of hammering a rate-limited endpoint.
+          await this.sleep(
+            computeBackoffDelay(attempt, this.core.retryBaseDelayMs, this.core.maxBackoffMs),
+            request.signal,
+          );
+          attempt += 1;
+        }
+      }
     } catch (error) {
       request.reject(error);
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
       this.removeAbortListener(request);
       this.core.active -= 1;
       this.drain();
     }
+  }
+
+  private async runAttempt<T>(request: PendingRequest<T>): Promise<T> {
+    if (request.timeoutMs === undefined) {
+      return request.run();
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        request.run(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new RequestTimeoutError(request.timeoutMs as number)),
+            request.timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  /** Waits `ms` milliseconds, rejecting early with the abort reason if `signal` fires. */
+  private sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
   }
 }
 
