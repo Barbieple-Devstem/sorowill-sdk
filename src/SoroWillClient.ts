@@ -23,6 +23,9 @@ import {
 } from './events';
 import type {
   BatchOperation,
+  BatchOperationResult,
+  BatchQueueOptions,
+  BatchQueueResult,
   BatchResult,
   Beneficiary,
   CreateWillParams,
@@ -66,6 +69,7 @@ import {
   TooManyIdsError,
   UnsupportedBatchSizeError,
   WalletNetworkMismatchError,
+  WillContractError,
   WebSocketNotConfiguredError,
   WillNotFoundError,
 } from './errors';
@@ -405,6 +409,13 @@ export interface SoroWillClientOptions {
    * `buildInvocationTransaction()` call made by this client.
    */
   transactionTimeoutSeconds?: number;
+  /**
+   * When `true`, every state-changing operation refuses to proceed if the
+   * wallet adapter cannot report its network (i.e. it does not implement
+   * `getNetwork`). Defaults to `false`, in which case such wallets are not
+   * checked and the network is only verified for adapters that can report it.
+   */
+  requireWalletNetwork?: boolean;
 }
 
 /** The raw, snake_case shape of a `Will` as decoded straight off the contract spec. */
@@ -869,6 +880,7 @@ export class SoroWillClient {
     this.network = options.network;
     this.hooks = options.hooks ?? new HookManager();
     this.wallet = options.wallet ?? getDefaultWalletAdapter();
+    this.requireWalletNetwork = options.requireWalletNetwork ?? false;
     this.pollAttempts = options.pollAttempts ?? DEFAULT_POLL_ATTEMPTS;
     if (!Number.isInteger(this.pollAttempts) || this.pollAttempts <= 0) {
       throw new RangeError('pollAttempts must be a positive integer');
@@ -938,6 +950,14 @@ export class SoroWillClient {
     }
 
     this.feeStatsCache = new Map();
+
+    // Scope cached reads to the configured network, and drop them whenever the
+    // wallet reports a network switch so testnet data is never served after
+    // switching to mainnet (or vice versa) (#603).
+    this.readCache?.setNetwork(this.networkPassphrase);
+    this.stopWatchingWalletNetwork = this.wallet.onNetworkChange?.(({ networkPassphrase }) => {
+      this.handleNetworkChange(networkPassphrase);
+    });
 
     if (this.readCache && options.eventSource) {
       // Subscribe and automatically clean up the listener if setup throws.
@@ -2111,6 +2131,109 @@ export class SoroWillClient {
   }
 
   /**
+   * Submits a queue of contract calls one after another, each as its own
+   * transaction (Soroban allows one contract invocation per transaction, see
+   * {@link batch}), and reports a per-operation outcome instead of throwing on
+   * the first failure.
+   *
+   * Partial failures are handled explicitly rather than leaving later
+   * operations queued against stale state:
+   * - A failing operation is retried up to `maxRetries` times. Contract errors
+   *   and wallet network mismatches are deterministic and are not retried.
+   * - With `onFailure: 'stop'` (the default), every operation after a failure
+   *   is marked `skipped` and never submitted. With `'continue'`, the rest of
+   *   the queue still runs.
+   * - Cached reads for every will touched by the queue are invalidated, so a
+   *   subsequent read reflects whatever actually landed on-chain.
+   * - Aborting `options.signal` marks every not-yet-submitted operation `skipped`.
+   *
+   * Operations that already succeeded are not rolled back — Soroban
+   * transactions are final once they land.
+   *
+   * @returns A {@link BatchQueueResult} with one entry per operation, in queue order.
+   * @throws {RangeError} If the queue is empty or `maxRetries` is not a non-negative integer.
+   */
+  async batchSequential(
+    operations: readonly BatchOperation[],
+    options: BatchQueueOptions = {},
+  ): Promise<BatchQueueResult> {
+    if (operations.length === 0) {
+      throw new RangeError('A batch must contain at least one operation');
+    }
+    const { onFailure = 'stop', maxRetries = 0, ...requestOptions } = options;
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new RangeError('maxRetries must be a non-negative integer');
+    }
+
+    const results: BatchOperationResult[] = [];
+    let halted: Error | undefined;
+
+    for (const [index, { method, args }] of operations.entries()) {
+      if (!halted && requestOptions.signal?.aborted) {
+        halted = new SoroWillError('Batch aborted before this operation was submitted', {
+          cause: requestOptions.signal.reason,
+        });
+      }
+      if (halted) {
+        results.push({ index, method, status: 'skipped', error: halted, attempts: 0 });
+        continue;
+      }
+
+      let attempts = 0;
+      let lastError: Error | undefined;
+      while (attempts <= maxRetries) {
+        attempts++;
+        try {
+          const { txHash } = await this.invoke(method, args, requestOptions);
+          results.push({ index, method, status: 'success', txHash, attempts });
+          lastError = undefined;
+          break;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (
+            err instanceof WillContractError ||
+            err instanceof WalletNetworkMismatchError ||
+            requestOptions.signal?.aborted
+          ) {
+            break;
+          }
+        }
+      }
+
+      if (lastError) {
+        results.push({ index, method, status: 'failed', error: lastError, attempts });
+        if (onFailure === 'stop') {
+          halted = new SoroWillError(
+            `Skipped because operation ${index} (${method}) failed: ${lastError.message}`,
+            { cause: lastError },
+          );
+        }
+      }
+    }
+
+    if (this.readCache) {
+      const willIds = new Set(
+        operations
+          .map(({ args }) => args.will_id)
+          .filter((willId) => willId !== undefined && willId !== null)
+          .map((willId) => String(willId)),
+      );
+      await Promise.all([...willIds].map((willId) => this.readCache!.invalidateByWillId(willId)));
+    }
+
+    const count = (status: BatchOperationResult['status']): number =>
+      results.filter((result) => result.status === status).length;
+    const succeededCount = count('success');
+    return {
+      success: succeededCount === operations.length,
+      results,
+      succeededCount,
+      failedCount: count('failed'),
+      skippedCount: count('skipped'),
+    };
+  }
+
+  /**
    * Builds a SEP-7 deep-link URI for a state-changing contract call, so a
    * mobile wallet can sign it outside the browser extension flow.
    *
@@ -2526,6 +2649,7 @@ export class SoroWillClient {
       unsubscribeFromWillEvents(this.eventSubscription);
       this.eventSubscription = undefined;
     }
+    this.stopWatchingWalletNetwork?.();
     this.inFlightTracker.clear();
     this.queue.rejectAll(new Error('SoroWillClient destroyed'));
   }
@@ -3368,6 +3492,11 @@ export class SoroWillClient {
    */
   async assertWalletNetwork(network: { networkPassphrase: string }): Promise<void> {
     if (!this.wallet.getNetwork) {
+      if (this.requireWalletNetwork) {
+        throw new SoroWillError(
+          'The wallet adapter cannot report its network (no getNetwork method), and requireWalletNetwork is enabled; refusing to sign',
+        );
+      }
       return;
     }
 

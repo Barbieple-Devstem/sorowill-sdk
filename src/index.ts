@@ -61,6 +61,10 @@ export type {
 
 export type {
   BatchOperation,
+  BatchOperationResult,
+  BatchOperationStatus,
+  BatchQueueOptions,
+  BatchQueueResult,
   BatchResult,
   Beneficiary,
   CreateWillParams,
@@ -156,6 +160,7 @@ export {
   ExorbitantFeeError,
   FixedAmountExceedsBalanceError,
   FreighterInstallCheckError,
+  FreighterNotAvailableError,
   GracePeriodExpiredError,
   GracePeriodNotExpiredError,
   GuardianCooldownActiveError,

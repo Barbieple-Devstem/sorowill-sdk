@@ -185,6 +185,12 @@ export class ReadCache {
    * repopulate the cache once it resolves.
    */
   private clearedBeforeHydration = false;
+  /**
+   * Network passphrase the cached entries belong to. Entries read on one
+   * network are meaningless on another, so switching networks clears the
+   * cache (see {@link ReadCache.setNetwork}).
+   */
+  private networkPassphrase: string | undefined;
 
   constructor(options: ReadCacheOptions = {}) {
     const ttlMs = options.ttlMs ?? 60_000;
@@ -309,6 +315,28 @@ export class ReadCache {
     }
 
     await Promise.all(keysToDelete.map((key) => this.delete(key)));
+  }
+
+  /** Returns the network passphrase the cache is currently scoped to, if any. */
+  getNetwork(): string | undefined {
+    return this.networkPassphrase;
+  }
+
+  /**
+   * Scopes the cache to `networkPassphrase`. If the cache was already scoped
+   * to a different network (e.g. the wallet switched testnet ↔ mainnet), every
+   * entry is cleared so data read on the previous network is never served.
+   *
+   * @returns `true` if the network changed and the cache was cleared.
+   */
+  setNetwork(networkPassphrase: string): boolean {
+    const changed =
+      this.networkPassphrase !== undefined && this.networkPassphrase !== networkPassphrase;
+    this.networkPassphrase = networkPassphrase;
+    if (changed) {
+      this.clear();
+    }
+    return changed;
   }
 
   clear(): void {

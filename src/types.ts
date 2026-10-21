@@ -387,6 +387,56 @@ export interface BatchResult {
   error?: Error;
 }
 
+/**
+ * Outcome of one operation in a {@link SoroWillClient.batchSequential} queue.
+ *
+ * - `success` — the operation's transaction landed.
+ * - `failed` — the operation failed after all permitted retries.
+ * - `skipped` — the operation was never submitted because an earlier
+ *   operation failed (with `onFailure: 'stop'`) or the request was aborted.
+ */
+export type BatchOperationStatus = 'success' | 'failed' | 'skipped';
+
+export interface BatchOperationResult {
+  /** Position of the operation in the submitted queue. */
+  index: number;
+  method: string;
+  status: BatchOperationStatus;
+  /** Transaction hash, present when `status` is `'success'`. */
+  txHash?: string;
+  /** Why the operation failed or was skipped. */
+  error?: Error;
+  /** Number of submission attempts made (0 for skipped operations). */
+  attempts: number;
+}
+
+export interface BatchQueueOptions extends RequestOptions {
+  /**
+   * What to do with the remaining operations after one fails:
+   * - `'stop'` (default) — mark every remaining operation `skipped` without
+   *   submitting it, since it may depend on state the failed operation
+   *   should have produced.
+   * - `'continue'` — keep submitting the remaining operations.
+   */
+  onFailure?: 'stop' | 'continue';
+  /**
+   * How many times to retry a failed operation before marking it `failed`.
+   * Contract errors and wallet network mismatches are deterministic and are
+   * never retried. Defaults to `0`.
+   */
+  maxRetries?: number;
+}
+
+export interface BatchQueueResult {
+  /** `true` only if every operation succeeded. */
+  success: boolean;
+  /** One entry per submitted operation, in queue order. */
+  results: BatchOperationResult[];
+  succeededCount: number;
+  failedCount: number;
+  skippedCount: number;
+}
+
 export interface RequestOptions {
   signal?: AbortSignal;
   retries?: number;
