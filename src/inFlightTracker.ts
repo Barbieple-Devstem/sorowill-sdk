@@ -164,8 +164,19 @@ export class InFlightTracker {
     }
 
     const controller = new AbortController();
+
+    // An operation that throws synchronously (before returning a PromiseLike)
+    // must surface as a rejected promise, never as a synchronous throw from
+    // track(), and must not leave an entry behind in the in-flight map.
+    let pending: PromiseLike<T>;
+    try {
+      pending = operation(controller.signal);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
     const entry = { controller, createdAt: Date.now() } as InFlightOperation<T>;
-    entry.promise = Promise.resolve(operation(controller.signal)).finally(() => {
+    entry.promise = Promise.resolve(pending).finally(() => {
       // Only remove the entry this call created; a newer track() may own the key now.
       if (this.inFlight.get(key) === entry) {
         this.inFlight.delete(key);

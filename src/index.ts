@@ -76,6 +76,9 @@ export { WillStatus, WillErrorCode } from './types';
 
 export {
   FreighterWalletAdapter,
+  WalletSessionError,
+  WalletSessionExpiredError,
+  assertWalletSessionActive,
   connectWallet,
   freighterAdapter,
   getDefaultWalletAdapter,
@@ -103,6 +106,7 @@ export {
   MemoryWalletConnectSessionStore,
   WalletConnectAdapter,
   WalletConnectTimeoutError,
+  WalletConnectUnsupportedMethodError,
 } from './walletConnect';
 export type {
   WalletConnectAdapterOptions,

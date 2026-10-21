@@ -38,8 +38,10 @@ import type {
 } from './types';
 import { WillStatus } from './types';
 import {
+  assertWalletSessionActive,
   getDefaultWalletAdapter,
   normalizeSignatureResponse,
+  type SignatureResponse,
   type WalletAdapter,
 } from './wallet';
 import {
@@ -2085,9 +2087,7 @@ export class SoroWillClient {
           context: 'batch',
         });
 
-        const signedTxResponse = await this.wallet.signTransaction(prepared.toXDR(), {
-          networkPassphrase: this.networkPassphrase,
-        });
+        const signedTxResponse = await this.signWithWallet(prepared.toXDR());
         const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
         const result = await this.submitSignedTransaction(signedTxXdr, options);
         txHash = result.txHash;
@@ -2964,9 +2964,7 @@ export class SoroWillClient {
             `${label}:prepareTransaction`,
           );
 
-          const feeBumpSignedResponse = await this.wallet.signTransaction(feeBumpPrepared.toXDR(), {
-            networkPassphrase: this.networkPassphrase,
-          });
+          const feeBumpSignedResponse = await this.signWithWallet(feeBumpPrepared.toXDR());
           const feeBumpSignedXdr = normalizeSignatureResponse(feeBumpSignedResponse);
           const feeBumpSignedTx = TransactionBuilder.fromXDR(
             feeBumpSignedXdr,
@@ -3029,6 +3027,19 @@ export class SoroWillClient {
         this.signedTransactionHashes.delete(trackedHash);
       }
     }
+  }
+
+  /**
+   * Hands a prepared transaction to the configured wallet for signing, first
+   * verifying that the wallet's session has not expired so a stale session
+   * fails fast with a {@link WalletSessionExpiredError} rather than an opaque
+   * downstream wallet error.
+   */
+  private async signWithWallet(transactionXdr: string): Promise<string | SignatureResponse> {
+    await assertWalletSessionActive(this.wallet);
+    return this.wallet.signTransaction(transactionXdr, {
+      networkPassphrase: this.networkPassphrase,
+    });
   }
 
   /**

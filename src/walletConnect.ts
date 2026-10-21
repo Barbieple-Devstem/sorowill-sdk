@@ -105,6 +105,7 @@ const DEFAULT_REQUIRED_NAMESPACES: Record<string, WalletConnectSessionNamespace>
   },
 };
 
+const DEFAULT_SIGN_TRANSACTION_METHOD = 'stellar_signXDR';
 const DEFAULT_DISCONNECT_REASON = { code: 6000, message: 'Disconnected by client' };
 const _DEFAULT_SIGN_TIMEOUT_MS = 120_000;
 const _DEFAULT_CONNECT_TIMEOUT_MS = 300_000;
@@ -128,6 +129,60 @@ export class WalletConnectTimeoutError extends Error {
     );
     this.name = 'WalletConnectTimeoutError';
     this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Raised when a WalletConnect session does not advertise support for the
+ * signing method the adapter needs (see
+ * {@link WalletConnectAdapterOptions.signTransactionMethod}). Detecting this
+ * at connection time avoids sending requests the wallet will reject.
+ */
+export class WalletConnectUnsupportedMethodError extends Error {
+  /** The signing method the adapter requires. */
+  readonly method: string;
+  /** The methods advertised by the wallet's session namespaces. */
+  readonly supportedMethods: string[];
+
+  constructor(method: string, supportedMethods: string[], options?: ErrorOptions) {
+    super(
+      supportedMethods.length === 0
+        ? `WalletConnect session does not declare any supported methods; "${method}" is required.`
+        : `WalletConnect session does not support required method "${method}". ` +
+            `Supported methods: ${supportedMethods.join(', ')}`,
+      options,
+    );
+    this.name = 'WalletConnectUnsupportedMethodError';
+    this.method = method;
+    this.supportedMethods = supportedMethods;
+  }
+}
+
+function getSessionMethods(session: WalletConnectSession): string[] {
+  const methods: string[] = [];
+  for (const namespace of Object.values(session.namespaces ?? {})) {
+    if (!Array.isArray(namespace?.methods)) {
+      continue;
+    }
+    for (const method of namespace.methods) {
+      if (typeof method === 'string' && method.length > 0) {
+        methods.push(method);
+      }
+    }
+  }
+  return methods;
+}
+
+/**
+ * Ensures the session's namespaces advertise the signing method. Method names
+ * are compared case-insensitively because wallets in the wild report both
+ * `stellar_signXDR` and `stellar_signXdr`.
+ */
+function assertSessionSupportsMethod(session: WalletConnectSession, method: string): void {
+  const supportedMethods = getSessionMethods(session);
+  const required = method.toLowerCase();
+  if (!supportedMethods.some((supported) => supported.toLowerCase() === required)) {
+    throw new WalletConnectUnsupportedMethodError(method, supportedMethods);
   }
 }
 
@@ -422,8 +477,10 @@ export class WalletConnectAdapter implements WalletAdapter {
       }
     }
 
+    const method = this.getSignTransactionMethod();
+    assertSessionSupportsMethod(session, method);
+
     const chainId = this.options.requestChainId ?? getDefaultChainId(session);
-    const method = this.options.signTransactionMethod ?? 'stellar_signXDR';
     const network = this.resolveNetwork(session);
     const params = this.options.getSignTransactionParams?.(xdr, network.networkPassphrase) ?? { xdr };
 
@@ -442,7 +499,12 @@ export class WalletConnectAdapter implements WalletAdapter {
     return extractor(response);
   }
 
+  private getSignTransactionMethod(): string {
+    return this.options.signTransactionMethod ?? DEFAULT_SIGN_TRANSACTION_METHOD;
+  }
+
   private useSession(session: WalletConnectSession): WalletConnection {
+    assertSessionSupportsMethod(session, this.getSignTransactionMethod());
     this.session = session;
     this.connection = {
       publicKey: (this.options.getPublicKeyFromSession ?? getDefaultPublicKeyFromSession)(session),
