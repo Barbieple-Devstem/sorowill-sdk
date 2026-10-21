@@ -105,6 +105,60 @@ function isProductionEnvironment(): boolean {
   return false;
 }
 
+/**
+ * Field names whose values are redacted from debug logs by default.
+ *
+ * Matching is case-insensitive and ignores `_` and `-`, and a field is
+ * redacted when its normalized name *contains* any entry, so `privateKey`,
+ * `private_key` and `signerPrivateKey` are all caught by `privateKey`.
+ */
+export const DEFAULT_REDACTED_KEYS: readonly string[] = Object.freeze([
+  'secret',
+  'privateKey',
+  'seed',
+  'mnemonic',
+  'password',
+  'apiKey',
+  'accessToken',
+  'authToken',
+  'refreshToken',
+  'authorization',
+  'cookie',
+]);
+
+/** Placeholder written in place of a redacted value. */
+export const REDACTED = '[REDACTED]';
+
+/**
+ * Stellar secret seeds (`S` + 55 base32 chars). Redacted wherever they appear
+ * in a logged string, including error messages and stack traces.
+ */
+const STELLAR_SECRET_SEED_PATTERN = /\bS[A-Z2-7]{55}\b/g;
+
+/** Options controlling how {@link DebugLogger} sanitizes log output. */
+export interface DebugLoggerOptions {
+  /**
+   * Redact sensitive fields and Stellar secret seeds from log output.
+   * Defaults to `true`. Set to `false` only in a trusted local environment.
+   */
+  readonly redact?: boolean;
+  /** Extra field names to redact, in addition to {@link DEFAULT_REDACTED_KEYS}. */
+  readonly redactKeys?: readonly string[];
+  /**
+   * Replace {@link DEFAULT_REDACTED_KEYS} with `redactKeys` instead of
+   * extending it. Defaults to `false`.
+   */
+  readonly replaceDefaultRedactKeys?: boolean;
+}
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[_-]/g, '');
+}
+
+function redactString(value: string): string {
+  return value.replace(STELLAR_SECRET_SEED_PATTERN, REDACTED);
+}
+
 interface DebugLog {
   timestamp: string;
   level: 'operation-build' | 'simulation' | 'submission' | 'poll' | 'success' | 'error';
@@ -248,6 +302,43 @@ export class DebugLogger {
     };
 
     this.log(log);
+  }
+
+  /** Returns `true` when values under `key` should be redacted. */
+  private isSensitiveKey(key: string): boolean {
+    const normalized = normalizeKey(key);
+    return this.redactKeys.some((pattern) => normalized.includes(pattern));
+  }
+
+  /**
+   * Recursively copies `value`, replacing sensitive fields with
+   * {@link REDACTED} and scrubbing Stellar secret seeds from strings.
+   */
+  private sanitize(value: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+    if (typeof value === 'string') {
+      return redactString(value);
+    }
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    if (value === null || typeof value !== 'object') {
+      return value;
+    }
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => this.sanitize(item, seen));
+    }
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = this.isSensitiveKey(key) ? REDACTED : this.sanitize(item, seen);
+    }
+    return result;
   }
 
   private log(log: DebugLog): void {

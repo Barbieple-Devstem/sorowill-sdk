@@ -65,6 +65,7 @@ import {
   UnsupportedBatchSizeError,
   WalletNetworkMismatchError,
   WebSocketNotConfiguredError,
+  WillNotFoundError,
 } from './errors';
 import { deepFreezeObject, hasDuplicateBeneficiaries, MAX_GUARDIANS, validateBeneficiaries } from './utils';
 import { RequestQueue } from './requestQueue';
@@ -74,7 +75,7 @@ import { buildSep7TxUri, type BuildSep7TxUriOptions } from './sep7';
 import { HookManager } from './hooks';
 import type { BeforeInvokeContext, AfterInvokeContext } from './hooks';
 import { assertPreparedTransactionMatchesIntendedOperation } from './txValidation';
-import { DebugLogger } from './debugLogger';
+import { DebugLogger, type DebugLoggerOptions } from './debugLogger';
 
 /** @internal Local alias for Soroban's `xdr.ScVal`; not part of the public API. */
 type ScVal = xdr.ScVal;
@@ -378,6 +379,12 @@ export interface SoroWillClientOptions {
    */
   debug?: boolean;
   /**
+   * Controls redaction of sensitive fields in debug logs. Redaction is on by
+   * default; pass extra field names via `redactKeys` to extend
+   * {@link DEFAULT_REDACTED_KEYS}.
+   */
+  debugLoggerOptions?: DebugLoggerOptions;
+  /**
    * If a transaction doesn't land within the poll window, automatically
    * rebuild and resubmit with a higher fee instead of throwing.
    * Defaults to false (opt-in).
@@ -572,7 +579,7 @@ export const MAX_CHECKIN_PERIOD_DAYS = 365 - 30;
 
 /** Maps SDK beneficiaries (0-100 `percentage`) to the contract's `{ address, basis_points }` shape. */
 function toContractBeneficiaries(
-  beneficiaries: Beneficiary[],
+  beneficiaries: readonly Beneficiary[],
 ): Array<{ address: string; basis_points: number }> {
   return beneficiaries.map((beneficiary) => ({
     address: beneficiary.address,
@@ -676,7 +683,7 @@ function normalizePositiveInteger(value: number | undefined, label: string): num
 function validateAmount(amount: string): bigint {
   // Only decimal digit strings with no leading minus or decimals are valid.
   // Must be at least one character, all digits, and the parsed value > 0.
-  if (!/^\d+$/.test(amount)) {
+  if (typeof amount !== 'string' || !/^\d+$/.test(amount)) {
     throw new SoroWillInvalidAmountError(amount);
   }
   const value = BigInt(amount);
@@ -915,7 +922,7 @@ export class SoroWillClient {
       throw new RangeError('retry.backoffFactor must be a finite number of at least 1');
     }
     this.debug = options.debug ?? false;
-    this.debugLogger = new DebugLogger(this.debug);
+    this.debugLogger = new DebugLogger(this.debug, options.debugLoggerOptions);
     this.autoFeeBumpOnTimeout = options.autoFeeBumpOnTimeout ?? false;
     this.transactionTimeoutSeconds = options.transactionTimeoutSeconds ?? 30;
     if (!Number.isFinite(this.transactionTimeoutSeconds) || this.transactionTimeoutSeconds <= 0) {
@@ -1534,13 +1541,15 @@ export class SoroWillClient {
     amount: string,
     options?: RequestOptions,
   ): Promise<{ txHash: string }> {
-    parseWillId(willId);
+    const parsedWillId = parseWillId(willId);
+    // Reject zero, negative, and malformed amounts before touching the wallet or RPC.
+    const parsedAmount = validateAmount(amount);
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
     const owner = await this.getWalletPublicKey();
     const { txHash } = await this.invoke('top_up', {
-      will_id: parseWillId(willId),
+      will_id: parsedWillId,
       owner,
-      amount: validateAmount(amount),
+      amount: parsedAmount,
     }, options);
     return { txHash };
   }

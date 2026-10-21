@@ -224,6 +224,9 @@ export {
 } from './requestQueue';
 export type { RequestQueueOptions } from './requestQueue';
 
+export { DebugLogger, DEFAULT_REDACTED_KEYS, REDACTED } from './debugLogger';
+export type { DebugLoggerOptions } from './debugLogger';
+
 export { buildSep7TxUri, parseSep7Callback } from './sep7';
 export { SEP7_MAX_ENVELOPE_BYTES, SEP7_MAX_URI_LENGTH } from './sep7';
 export type { BuildSep7TxUriOptions, Sep7CallbackResult } from './sep7';
