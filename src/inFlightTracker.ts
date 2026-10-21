@@ -219,19 +219,24 @@ export class InFlightTracker {
    * original operation is still pending before acting. If the original operation
    * has already settled (success or failure), the in-flight entry is gone and the
    * guard prevents a duplicate submission.
+   *
+   * Pass the same `clientId` that was given to {@link track} so the pending
+   * check is scoped to that client; otherwise a pending operation from one
+   * client could be mistaken for (or hidden from) another client's (issue #580).
    */
   trackIfPending<T>(
     willId: string | bigint,
     method: string,
     operation: (signal: AbortSignal) => PromiseLike<T>,
+    clientId?: string,
   ): Promise<T> | undefined {
-    const key = this.getKey(willId, method);
+    const key = this.getKey(willId, method, clientId);
 
     if (!this.inFlight.has(key)) {
       return undefined;
     }
 
-    return this.track(willId, method, operation);
+    return this.track(willId, method, operation, clientId);
   }
 
   clear(): void {

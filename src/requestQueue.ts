@@ -17,7 +17,7 @@ export const DEFAULT_MAX_QUEUE_SIZE = 1_000;
  * were already being processed.
  */
 export interface RequestQueueOptions {
-  /** Maximum number of RPC requests in flight at once. Defaults to 4. */
+  /** Maximum number of RPC requests in flight at once. Must be an integer >= 1. Defaults to 4. */
   maxConcurrent?: number;
   /**
    * Maximum number of RPC requests started in any rolling one-second window. Defaults to 10.
@@ -62,6 +62,16 @@ interface PendingRequest<T> {
   priority: RequestPriority;
   enqueuedAt: number;
   method: string | undefined;
+}
+
+/**
+ * Throws a RangeError unless `value` is an integer >= 1. Rejects 0, negative
+ * numbers, NaN, Infinity, fractions, and non-number values (issue #582).
+ */
+function assertPositiveInteger(name: string, value: unknown): asserts value is number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new RangeError(`${name} must be a positive integer (>= 1), received ${String(value)}`);
+  }
 }
 
 /**

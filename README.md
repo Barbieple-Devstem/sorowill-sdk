@@ -123,6 +123,25 @@ For Node.js scripts:
 esbuild src/script.ts --bundle --format=esm --platform=node --outfile=dist/script.mjs
 ```
 
+## Upgrading
+
+Breaking changes between SDK versions are documented in
+[MIGRATION.md](./MIGRATION.md), with before/after code examples and any
+one-time data migrations. The guide is also shipped in the npm package at
+`node_modules/@sorowill/sdk/MIGRATION.md`.
+
+While the SDK is pre-1.0, minor releases may contain breaking changes, so
+prefer a tilde range (`"@sorowill/sdk": "~0.1.1"`) or an exact version. When
+upgrading:
+
+1. Read every MIGRATION.md section between your current and target versions.
+2. Install the exact target version (`npm install @sorowill/sdk@<version> --save-exact`).
+3. Run `npx tsc --noEmit` — most breaking type changes surface as compile errors.
+4. Migrate any persisted SDK data (stored `Will`/`Beneficiary` objects, persisted read cache).
+5. Verify your flows on testnet before deploying to mainnet.
+
+See [CHANGELOG.md](./CHANGELOG.md) for the full list of changes in each release.
+
 ## Quick Start
 
 ```ts

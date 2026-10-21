@@ -66,8 +66,7 @@ export function deserializeCacheValue<T>(value: string): T {
       currentValue &&
       typeof currentValue === 'object' &&
       '__type' in currentValue &&
-      'value' in currentValue &&
-      typeof currentValue.value === 'string'
+      'value' in currentValue
     ) {
       const type = currentValue.__type as string;
       if (type === 'bigint') {
@@ -378,7 +377,7 @@ export class ReadCache {
 
       const entry: CacheEntry = {
         key: persistedEntry.key,
-        value: deserializeCacheValue(persistedEntry.value),
+        value,
         expiresAt: persistedEntry.expiresAt,
         willIds: new Set(persistedEntry.willIds),
       };

@@ -20,7 +20,9 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "MIGRATION.md",
+    "CHANGELOG.md"
   ],
   "sideEffects": false,
   "scripts": {
