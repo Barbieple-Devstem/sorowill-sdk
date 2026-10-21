@@ -1,4 +1,51 @@
 /**
+ * Log severity levels used by {@link DebugLogger} for filtering output.
+ *
+ * Levels are ordered from most severe (lowest priority number) to least
+ * severe (highest priority number). A logger configured with a minimum level
+ * suppresses all entries below that threshold.
+ *
+ * @since 0.1.2
+ */
+export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
+
+/**
+ * Priority rank for each {@link LogLevel}. Lower numbers are more severe and
+ * are always logged when their threshold is met or exceeded.
+ */
+const SEVERITY_PRIORITY: Record<LogLevel, number> = {
+  error: 0,
+  warn: 1,
+  info: 2,
+  debug: 3,
+};
+
+/**
+ * Default minimum severity. `debug` preserves the existing behavior (all
+ * levels logged when the logger is active). Set `SOROWILL_LOG_LEVEL` to a
+ * more severe level (e.g. `error`) to suppress less important output.
+ */
+const DEFAULT_LOG_LEVEL: LogLevel = 'debug';
+
+/**
+ * Resolves the minimum log severity from the `SOROWILL_LOG_LEVEL` environment
+ * variable. Falls back to {@link DEFAULT_LOG_LEVEL} when the variable is
+ * unset, empty, or contains an unrecognized value.
+ */
+function resolveLogLevel(): LogLevel {
+  const raw =
+    typeof process !== 'undefined' &&
+    typeof process.env !== 'undefined' &&
+    typeof process.env['SOROWILL_LOG_LEVEL'] === 'string'
+      ? process.env['SOROWILL_LOG_LEVEL'].trim().toLowerCase()
+      : undefined;
+  if (raw && raw in SEVERITY_PRIORITY) {
+    return raw as LogLevel;
+  }
+  return DEFAULT_LOG_LEVEL;
+}
+
+/**
  * Determines whether debug logging should be active based on environment.
  *
  * Logging is active when ALL of the following are true:
@@ -58,13 +105,82 @@ function isProductionEnvironment(): boolean {
   return false;
 }
 
+/**
+ * Field names whose values are redacted from debug logs by default.
+ *
+ * Matching is case-insensitive and ignores `_` and `-`, and a field is
+ * redacted when its normalized name *contains* any entry, so `privateKey`,
+ * `private_key` and `signerPrivateKey` are all caught by `privateKey`.
+ */
+export const DEFAULT_REDACTED_KEYS: readonly string[] = Object.freeze([
+  'secret',
+  'privateKey',
+  'seed',
+  'mnemonic',
+  'password',
+  'apiKey',
+  'accessToken',
+  'authToken',
+  'refreshToken',
+  'authorization',
+  'cookie',
+]);
+
+/** Placeholder written in place of a redacted value. */
+export const REDACTED = '[REDACTED]';
+
+/**
+ * Stellar secret seeds (`S` + 55 base32 chars). Redacted wherever they appear
+ * in a logged string, including error messages and stack traces.
+ */
+const STELLAR_SECRET_SEED_PATTERN = /\bS[A-Z2-7]{55}\b/g;
+
+/** Options controlling how {@link DebugLogger} sanitizes log output. */
+export interface DebugLoggerOptions {
+  /**
+   * Redact sensitive fields and Stellar secret seeds from log output.
+   * Defaults to `true`. Set to `false` only in a trusted local environment.
+   */
+  readonly redact?: boolean;
+  /** Extra field names to redact, in addition to {@link DEFAULT_REDACTED_KEYS}. */
+  readonly redactKeys?: readonly string[];
+  /**
+   * Replace {@link DEFAULT_REDACTED_KEYS} with `redactKeys` instead of
+   * extending it. Defaults to `false`.
+   */
+  readonly replaceDefaultRedactKeys?: boolean;
+}
+
+function normalizeKey(key: string): string {
+  return key.toLowerCase().replace(/[_-]/g, '');
+}
+
+function redactString(value: string): string {
+  return value.replace(STELLAR_SECRET_SEED_PATTERN, REDACTED);
+}
+
 interface DebugLog {
   timestamp: string;
   level: 'operation-build' | 'simulation' | 'submission' | 'poll' | 'success' | 'error';
+  /** Severity used for filtering against the configured minimum level. */
+  severity?: LogLevel;
   method: string;
   willId?: string | undefined;
   details: Record<string, unknown>;
 }
+
+/**
+ * Maps each {@link DebugLog.level} to its {@link LogLevel} severity so the
+ * `log()` method can filter entries below the configured minimum threshold.
+ */
+const LEVEL_SEVERITY: Record<DebugLog['level'], LogLevel> = {
+  'operation-build': 'info',
+  simulation: 'debug',
+  submission: 'info',
+  poll: 'debug',
+  success: 'info',
+  error: 'error',
+};
 
 export class DebugLogger {
   /**
@@ -77,8 +193,19 @@ export class DebugLogger {
    */
   readonly isActive: boolean;
 
+  /**
+   * Minimum severity this logger will emit. Resolved at construction time
+   * from the `SOROWILL_LOG_LEVEL` environment variable (default: `debug`,
+   * i.e. everything). Setting `SOROWILL_LOG_LEVEL=error` suppresses all
+   * entries except `error`-level ones.
+   *
+   * @since 0.1.2
+   */
+  readonly minLevel: LogLevel;
+
   constructor(enabled: boolean) {
     this.isActive = resolveEnabled(enabled);
+    this.minLevel = resolveLogLevel();
   }
 
   logOperationBuild(method: string, willId: string | undefined = undefined, details: Record<string, unknown> | undefined = undefined): void {
@@ -177,7 +304,46 @@ export class DebugLogger {
     this.log(log);
   }
 
+  /** Returns `true` when values under `key` should be redacted. */
+  private isSensitiveKey(key: string): boolean {
+    const normalized = normalizeKey(key);
+    return this.redactKeys.some((pattern) => normalized.includes(pattern));
+  }
+
+  /**
+   * Recursively copies `value`, replacing sensitive fields with
+   * {@link REDACTED} and scrubbing Stellar secret seeds from strings.
+   */
+  private sanitize(value: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
+    if (typeof value === 'string') {
+      return redactString(value);
+    }
+    if (typeof value === 'bigint') {
+      return value.toString();
+    }
+    if (value === null || typeof value !== 'object') {
+      return value;
+    }
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+    seen.add(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => this.sanitize(item, seen));
+    }
+    if (value instanceof Date) {
+      return value.toISOString();
+    }
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      result[key] = this.isSensitiveKey(key) ? REDACTED : this.sanitize(item, seen);
+    }
+    return result;
+  }
+
   private log(log: DebugLog): void {
+    const severity: LogLevel = log.severity ?? LEVEL_SEVERITY[log.level];
+    if (SEVERITY_PRIORITY[severity] > SEVERITY_PRIORITY[this.minLevel]) return;
     // Structured, JSON-serializable output covering multiple log levels
     // (not just warn/error), so console.log is intentional here.
     // eslint-disable-next-line no-console

@@ -1,4 +1,4 @@
-import { SoroWillError } from './errors';
+import { DuplicateOperationError } from './errors';
 
 type OperationKey = string;
 type OperationResult<T> = Promise<T>;
@@ -230,17 +230,19 @@ export class InFlightTracker {
     }
 
     const controller = new AbortController();
-    const entry = {
-      controller,
-      createdAt: Date.now(),
-      wallet: walletAddress,
-      released: false,
-    } as InFlightOperation<T>;
-    if (walletAddress !== undefined) {
-      this.walletCounts.set(walletAddress, this.getWalletInFlightCount(walletAddress) + 1);
+
+    // An operation that throws synchronously (before returning a PromiseLike)
+    // must surface as a rejected promise, never as a synchronous throw from
+    // track(), and must not leave an entry behind in the in-flight map.
+    let pending: PromiseLike<T>;
+    try {
+      pending = operation(controller.signal);
+    } catch (error) {
+      return Promise.reject(error);
     }
-    entry.promise = Promise.resolve(operation(controller.signal)).finally(() => {
-      this.releaseWallet(entry as InFlightOperation<unknown>);
+
+    const entry = { controller, createdAt: Date.now() } as InFlightOperation<T>;
+    entry.promise = Promise.resolve(pending).finally(() => {
       // Only remove the entry this call created; a newer track() may own the key now.
       if (this.inFlight.get(key) === entry) {
         this.inFlight.delete(key);
@@ -252,25 +254,66 @@ export class InFlightTracker {
   }
 
   /**
+   * Like {@link track}, but rejects the duplicate instead of coalescing it
+   * onto the in-flight promise.
+   *
+   * When an unexpired operation is already in flight for the same
+   * (willId, method) pair, the returned promise rejects with a
+   * {@link DuplicateOperationError} and `operation` is never invoked. This
+   * guarantees that at most one transaction per (willId, method) can be
+   * submitted at a time, even across concurrent callers (#523).
+   *
+   * Expired entries are lazily evicted first, so a stale entry (e.g. an
+   * operation that never settled) cannot block retries forever.
+   *
+   * @throws {DuplicateOperationError} via the returned (rejected) promise when
+   *   an identical operation is already in flight.
+   */
+  trackExclusive<T>(
+    willId: string | bigint,
+    method: string,
+    operation: (signal: AbortSignal) => PromiseLike<T>,
+    clientId?: string,
+  ): Promise<T> {
+    const key = this.getKey(willId, method, clientId);
+
+    const existing = this.inFlight.get(key);
+    if (existing) {
+      if (!this.isExpired(existing)) {
+        return Promise.reject(new DuplicateOperationError(willId, method));
+      }
+      // Expired entry — evict and start a fresh operation.
+      this.evict(key, existing);
+    }
+
+    return this.track(willId, method, operation, clientId);
+  }
+
+  /**
    * Runs `operation` only if no operation is currently in flight for the given
    * will/method pair. Unlike {@link track}, this is intended for timeout-driven
    * follow-up work (e.g. auto fee-bump) where the caller must first confirm the
    * original operation is still pending before acting. If the original operation
    * has already settled (success or failure), the in-flight entry is gone and the
    * guard prevents a duplicate submission.
+   *
+   * Pass the same `clientId` that was given to {@link track} so the pending
+   * check is scoped to that client; otherwise a pending operation from one
+   * client could be mistaken for (or hidden from) another client's (issue #580).
    */
   trackIfPending<T>(
     willId: string | bigint,
     method: string,
     operation: (signal: AbortSignal) => PromiseLike<T>,
+    clientId?: string,
   ): Promise<T> | undefined {
-    const key = this.getKey(willId, method);
+    const key = this.getKey(willId, method, clientId);
 
     if (!this.inFlight.has(key)) {
       return undefined;
     }
 
-    return this.track(willId, method, operation);
+    return this.track(willId, method, operation, clientId);
   }
 
   clear(): void {

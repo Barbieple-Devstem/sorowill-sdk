@@ -1,6 +1,11 @@
 import type FreighterApi from '@stellar/freighter-api';
 
-import { FreighterInstallCheckError, SignTransactionTimeoutError, WalletNetworkMismatchError } from './errors';
+import {
+  FreighterInstallCheckError,
+  FreighterNotAvailableError,
+  SignTransactionTimeoutError,
+  WalletNetworkMismatchError,
+} from './errors';
 
 export class WalletSessionError extends Error {
   constructor(message: string, cause?: unknown) {
@@ -10,10 +15,75 @@ export class WalletSessionError extends Error {
 }
 
 /**
+ * Union of the typed errors a {@link WalletAdapter} implementation — or the
+ * SDK itself on the adapter's behalf — can raise (#524).
+ *
+ * Every adapter method documents which of these it may throw. Adapters may
+ * additionally throw a plain `Error` carrying a wallet-reported message (for
+ * example, "user rejected the request"), since third-party wallet libraries
+ * surface their failures that way; use the type guards below to distinguish
+ * the SDK-typed errors from such wallet-reported failures.
+ *
+ * Transport-specific adapters may raise additional errors (e.g.
+ * `WalletConnectTimeoutError` from the WalletConnect transport); those are
+ * documented on the respective adapter classes.
+ */
+export type WalletAdapterError =
+  /** Session token could not be read, refreshed, or is still invalid. */
+  | WalletSessionError
+  /** The wallet's `signTransaction` did not resolve within the allowed time. */
+  | SignTransactionTimeoutError
+  /** The wallet is connected to a different network than the client expects. */
+  | WalletNetworkMismatchError
+  /** Freighter's presence could not be determined due to an internal error. */
+  | FreighterInstallCheckError;
+
+/** Type guard for {@link WalletSessionError}. */
+export function isWalletSessionError(error: unknown): error is WalletSessionError {
+  return error instanceof WalletSessionError;
+}
+
+/** Type guard for {@link SignTransactionTimeoutError}. */
+export function isSignTransactionTimeoutError(
+  error: unknown,
+): error is SignTransactionTimeoutError {
+  return error instanceof SignTransactionTimeoutError;
+}
+
+/** Type guard for {@link WalletNetworkMismatchError}. */
+export function isWalletNetworkMismatchError(
+  error: unknown,
+): error is WalletNetworkMismatchError {
+  return error instanceof WalletNetworkMismatchError;
+}
+
+/** Type guard for {@link FreighterInstallCheckError}. */
+export function isFreighterInstallCheckError(
+  error: unknown,
+): error is FreighterInstallCheckError {
+  return error instanceof FreighterInstallCheckError;
+}
+
+/**
  * Represents a wallet session token used for transaction signing.
  */
 export interface WalletSession {
   token: string;
+  /**
+   * Session expiry as UTC milliseconds since the Unix epoch
+   * (`Date.now()`-compatible). Compare against `Date.now()` to determine
+   * whether the session is still valid. A session is considered expired when
+   * `expiresAt <= now`.
+   *
+   * @example
+   * ```ts
+   * // 15 minutes from now (UTC milliseconds)
+   * const session: WalletSession = {
+   *   token: 'abc123',
+   *   expiresAt: Date.now() + 15 * 60 * 1000,
+   * };
+   * ```
+   */
   expiresAt?: number;
 }
 
@@ -35,8 +105,86 @@ function loadFreighterApi(): Promise<typeof FreighterApi> {
   return freighterApiPromise;
 }
 
+/** Default number of times to check for Freighter's window injection. */
+export const DEFAULT_FREIGHTER_INJECTION_RETRIES = 10;
+
+/** Default delay (ms) between Freighter window-injection checks. */
+export const DEFAULT_FREIGHTER_INJECTION_RETRY_DELAY_MS = 100;
+
+/**
+ * Reports whether the Freighter extension has injected its global into the
+ * page. Older Freighter builds expose `window.freighter`; newer ones (and the
+ * Stellar wallet standard) use `window.stellar`.
+ */
+function isFreighterInjected(): boolean {
+  const win = (globalThis as { window?: Record<string, unknown> }).window;
+  return Boolean(win && (win.freighter || win.stellar));
+}
+
+/**
+ * Waits for the Freighter extension to inject itself into the page.
+ *
+ * Browser extensions inject their content scripts asynchronously, so a page
+ * that calls into Freighter immediately on load can race the injection: the
+ * `@stellar/freighter-api` module import resolves, but `window.freighter` /
+ * `window.stellar` is still undefined and the first API call fails. This
+ * polls for the injected global, retrying up to `retries` times with
+ * `delayMs` between checks, and throws a {@link FreighterNotAvailableError}
+ * if it never appears.
+ *
+ * Outside a browser (no `window`) there is nothing to wait for, so this
+ * resolves immediately and leaves the "not installed" handling to
+ * Freighter's own API responses.
+ */
+export async function waitForFreighterInjection(
+  retries: number = DEFAULT_FREIGHTER_INJECTION_RETRIES,
+  delayMs: number = DEFAULT_FREIGHTER_INJECTION_RETRY_DELAY_MS,
+): Promise<void> {
+  if (typeof (globalThis as { window?: unknown }).window === 'undefined') {
+    return;
+  }
+  const attempts = Math.max(1, Math.floor(retries));
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    if (isFreighterInjected()) {
+      return;
+    }
+    if (attempt < attempts) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw new FreighterNotAvailableError(attempts);
+}
+
 /** Default timeout (ms) for a wallet signTransaction call. */
 const DEFAULT_SIGN_TIMEOUT_MS = 120_000;
+
+/**
+ * Minimum Freighter extension version required by this SDK.
+ *
+ * Freighter versions below this may not support the APIs used by
+ * {@link FreighterWalletAdapter} (e.g. `requestAccess`, `getNetworkDetails`,
+ * `getAddress`, `signTransaction`). Consumers should ensure users update
+ * Freighter before attempting to connect.
+ */
+export const MIN_FREIGHTER_VERSION = '6.0.0';
+
+/**
+ * Compares two semantic version strings (e.g. `6.0.0`, `6.1.2`).
+ * Returns `true` if `a` is greater than or equal to `b`.
+ */
+function gteVersion(a: string, b: string): boolean {
+  const parse = (v: string): number[] =>
+    v.split('.').map((part) => Number.parseInt(part, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const va = pa[i] ?? 0;
+    const vb = pb[i] ?? 0;
+    if (va > vb) return true;
+    if (va < vb) return false;
+  }
+  return true;
+}
 
 /**
  * The `code` Freighter's `isConnected()` API returns for the ordinary
@@ -129,17 +277,25 @@ export function extractSignedEnvelopeXdr(response: unknown): string {
   );
 }
 
+/** Options passed to {@link WalletAdapter.signTransaction}. */
+export interface SignTransactionOptions {
+  networkPassphrase: string;
+  timeoutMs?: number;
+}
+
 /**
  * The full capability set a Stellar wallet must expose for
  * {@link SoroWillClient} to read the connected account and sign transactions.
  *
- * Any wallet — Freighter, Albedo, xBull, Rabet, Lobstr, etc. — can be plugged
- * into the client by implementing this interface. {@link FreighterWalletAdapter}
- * is the default implementation, backed by the Freighter browser extension.
- */
-/**
- * The full capability set a Stellar wallet must expose for
- * {@link SoroWillClient} to read the connected account and sign transactions.
+ * ### Error contract (#524)
+ *
+ * Methods document the typed errors they may raise via `@throws`, all of
+ * which are members of the {@link WalletAdapterError} union. Use the
+ * accompanying type guards (`isWalletSessionError`,
+ * `isSignTransactionTimeoutError`, `isWalletNetworkMismatchError`,
+ * `isFreighterInstallCheckError`) to narrow an unknown failure. Adapters may
+ * additionally reject with a plain `Error` whose message comes from the
+ * wallet itself (e.g. the user dismissed the approval prompt).
  *
  * Any wallet — Freighter, Albedo, xBull, Rabet, Lobstr, etc. — can be plugged
  * into the client by implementing this interface. The module-level
@@ -156,8 +312,8 @@ export function extractSignedEnvelopeXdr(response: unknown): string {
  * ### Scripts, automation, and testing — `KeypairSigner`
  *
  * For Node.js scripts, keeper bots, demo scripts, or unit tests where there is
- * no browser extension available, build a lightweight adapter directly on top
- * of `@stellar/stellar-sdk`'s `Keypair`:
+ * no browser extension available, build a lightweight adapter on top of
+ * `@stellar/stellar-sdk`'s `Keypair`:
  *
  * ```ts
  * import { Keypair, Transaction, TransactionBuilder } from '@stellar/stellar-sdk';
@@ -196,31 +352,88 @@ export function extractSignedEnvelopeXdr(response: unknown): string {
  * > to handle real end-user funds in a browser or any environment where the
  * > secret could be exposed to untrusted code.
  */
-export interface SignTransactionOptions {
-  networkPassphrase: string;
-  timeoutMs?: number;
-}
-
 export interface WalletAdapter {
+  /**
+   * Reports whether the wallet is currently connected.
+   *
+   * @throws {FreighterInstallCheckError} When the wallet's presence cannot be
+   *   determined due to an internal error (Freighter only; other adapters may
+   *   throw a plain `Error` instead).
+   */
   isConnected(): Promise<boolean>;
+  /**
+   * Prompts the user (if required) and establishes a connection.
+   *
+   * @throws {WalletNetworkMismatchError} When the wallet is connected to a
+   *   network that differs from the client's expected network passphrase.
+   * @throws {Error} When the user rejects the connection or the wallet reports
+   *   an internal failure.
+   */
   connect(): Promise<WalletConnection>;
+  /**
+   * Re-establishes a previous connection without re-prompting the user where
+   * possible.
+   *
+   * @throws {WalletNetworkMismatchError} When the wallet is connected to a
+   *   network that differs from the client's expected network passphrase.
+   * @throws {Error} When reconnection fails or the session can no longer be
+   *   restored.
+   */
   reconnect(): Promise<WalletConnection>;
+  /**
+   * Tears down the current connection and clears any local session state.
+   *
+   * @throws {Error} When the wallet reports a failure while disconnecting.
+   */
   disconnect(): Promise<void>;
+  /**
+   * Returns the public key of the currently connected account.
+   *
+   * @throws {Error} When no account is connected or the wallet reports an
+   *   internal failure.
+   */
   getPublicKey(): Promise<string>;
+  /**
+   * Signs a transaction envelope, returning either the signed XDR string or a
+   * {@link SignatureResponse} object carrying `envelope_xdr`.
+   *
+   * @throws {SignTransactionTimeoutError} When the wallet does not respond
+   *   within `opts.timeoutMs` (e.g. a dismissed or hung approval popup).
+   * @throws {WalletSessionError} When the adapter issues session tokens and
+   *   the current token is expired and cannot be refreshed.
+   * @throws {Error} When the wallet rejects the request (e.g. the user
+   *   declined to sign) or returns a malformed response.
+   */
   signTransaction(
     transactionXdr: string,
     opts: SignTransactionOptions,
   ): Promise<string | SignatureResponse>;
-  /** Reports the network this wallet is currently set to, without prompting the user. Optional — not every wallet adapter can report this. */
+  /**
+   * Reports the network this wallet is currently set to, without prompting the user. Optional — not every wallet adapter can report this.
+   *
+   * @throws {Error} When the wallet cannot report its current network.
+   */
   getNetwork?(): Promise<{ network: string; networkPassphrase: string }>;
+  /**
+   * Registers `listener` to be called whenever the wallet switches to a
+   * different network. Returns a function that removes the listener.
+   * Optional — {@link SoroWillClient} uses it to drop cached reads from the
+   * previous network.
+   */
+  onNetworkChange?(listener: WalletNetworkChangeListener): () => void;
   /**
    * Returns the current session token for this wallet, if the adapter issues
    * one. Optional — adapters that do not use session tokens may omit it.
+   *
+   * @throws {WalletSessionError} When the session cannot be read.
    */
   getSession?(): Promise<WalletSession | undefined>;
   /**
    * Refreshes an expired/invalid session token and returns the new one.
    * Optional — only meaningful for adapters that issue session tokens.
+   *
+   * @throws {WalletSessionError} When the session cannot be refreshed or the
+   *   refreshed token is still invalid.
    */
   refreshSession?(): Promise<WalletSession>;
 }
@@ -282,6 +495,16 @@ export async function ensureValidSession(
 }
 
 /**
+ * Options for configuring a wallet session.
+ *
+ * `sessionTtlMs` overrides the default session token TTL (15 minutes).
+ * When omitted, {@link DEFAULT_SESSION_TTL_MS} is used.
+ */
+export interface WalletSessionOptions {
+  sessionTtlMs?: number;
+}
+
+/**
  * Options accepted by {@link FreighterWalletAdapter}.
  *
  * `expectedNetworkPassphrase` is the network the SDK/client is configured for.
@@ -289,19 +512,47 @@ export async function ensureValidSession(
  * on `connect()`/`reconnect()` and rejects with a
  * {@link WalletNetworkMismatchError} on mismatch — instead of letting a
  * testnet wallet silently sign for a mainnet-configured client.
+ *
+ * `sessionTtlMs` overrides the default session token TTL (15 minutes).
  */
-export interface FreighterWalletAdapterOptions {
+export interface FreighterWalletAdapterOptions extends WalletSessionOptions {
   expectedNetworkPassphrase?: string;
+  /**
+   * How many times to check for Freighter's window injection before failing
+   * with a {@link FreighterNotAvailableError}. Defaults to
+   * {@link DEFAULT_FREIGHTER_INJECTION_RETRIES}.
+   */
+  injectionRetries?: number;
+  /**
+   * Delay in milliseconds between injection checks. Defaults to
+   * {@link DEFAULT_FREIGHTER_INJECTION_RETRY_DELAY_MS}.
+   */
+  injectionRetryDelayMs?: number;
 }
 
+/**
+ * Browser-extension wallet adapter backed by the Freighter browser extension.
+ *
+ * ## Minimum Freighter version
+ *
+ * This adapter requires Freighter {@link MIN_FREIGHTER_VERSION} or later.
+ * Older versions may not support the `@stellar/freighter-api` methods used
+ * here (`requestAccess`, `getNetworkDetails`, `getAddress`, `signTransaction`).
+ * The version is checked on {@link connect} and an error is thrown if the
+ * installed Freighter is below the minimum.
+ *
+ * @since 0.1.0
+ */
 export class FreighterWalletAdapter implements WalletAdapter {
   private readonly expectedNetworkPassphrase?: string;
+  private readonly sessionTtlMs: number;
   private session?: WalletSession;
 
   constructor(options: FreighterWalletAdapterOptions = {}) {
     if (options.expectedNetworkPassphrase !== undefined) {
       this.expectedNetworkPassphrase = options.expectedNetworkPassphrase;
     }
+    this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
   }
 
   /**
@@ -315,6 +566,40 @@ export class FreighterWalletAdapter implements WalletAdapter {
     }
     if (networkPassphrase !== this.expectedNetworkPassphrase) {
       throw new WalletNetworkMismatchError(this.expectedNetworkPassphrase, networkPassphrase);
+    }
+  }
+
+  /**
+   * Asserts that the installed Freighter extension meets the minimum version
+   * requirement ({@link MIN_FREIGHTER_VERSION}).
+   *
+   * Attempts to read the Freighter API version from the loaded
+   * `@stellar/freighter-api` module. If the version cannot be determined or
+   * is below the minimum, throws a {@link FreighterInstallCheckError}.
+   */
+  private async assertFreighterVersion(): Promise<void> {
+    try {
+      const freighterApi = await loadFreighterApi();
+      const version =
+        (freighterApi as unknown as { version?: string }).version ??
+        (freighterApi as unknown as { default?: { version?: string } }).default
+          ?.version;
+      if (version && !gteVersion(version, MIN_FREIGHTER_VERSION)) {
+        throw new FreighterInstallCheckError(
+          -1,
+          `Freighter version ${version} is below the minimum required version ${MIN_FREIGHTER_VERSION}. Please update Freighter.`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof FreighterInstallCheckError) {
+        throw err;
+      }
+      // If we cannot determine the version, warn but do not block — the
+      // extension may still work even if its version is not exposed.
+      console.warn(
+        `[SoroWill] Could not determine Freighter version; proceeding without version check. ` +
+          `Ensure Freighter is at least v${MIN_FREIGHTER_VERSION}.`,
+      );
     }
   }
 
@@ -340,6 +625,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
   }
 
   async connect(): Promise<WalletConnection> {
+    await this.assertFreighterVersion();
     const freighterApi = await loadFreighterApi();
     const access = await freighterApi.requestAccess();
     if (access.error) {
@@ -363,7 +649,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
 
   async reconnect(): Promise<WalletConnection> {
     const publicKey = await this.getPublicKey();
-    const freighterApi = await loadFreighterApi();
+    const freighterApi = await this.loadInjectedFreighterApi();
     const networkDetails = await freighterApi.getNetworkDetails();
     if (networkDetails?.error) {
       throw new Error(networkDetails.error.message);
@@ -386,7 +672,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
 
   /** Reports the network Freighter is currently set to, without prompting the user. */
   async getNetwork(): Promise<{ network: string; networkPassphrase: string }> {
-    const freighterApi = await loadFreighterApi();
+    const freighterApi = await this.loadInjectedFreighterApi();
     const networkDetails = await freighterApi.getNetworkDetails();
     if (networkDetails?.error) {
       throw new Error(networkDetails.error.message);
@@ -397,8 +683,52 @@ export class FreighterWalletAdapter implements WalletAdapter {
     };
   }
 
+  /**
+   * Watches Freighter for network switches using its `WatchWalletChanges`
+   * poller and calls `listener` whenever the network passphrase changes.
+   * The first reported network is recorded as the baseline and does not
+   * trigger the listener. Returns a function that stops watching.
+   *
+   * Outside a browser there is no extension to watch, so this is a no-op.
+   */
+  onNetworkChange(listener: WalletNetworkChangeListener): () => void {
+    if (typeof (globalThis as { window?: unknown }).window === 'undefined') {
+      return () => {};
+    }
+    let stopped = false;
+    let watcher: { stop(): void } | undefined;
+    let lastPassphrase: string | undefined;
+
+    void this.loadInjectedFreighterApi()
+      .then((freighterApi) => {
+        if (stopped || typeof freighterApi.WatchWalletChanges !== 'function') {
+          return;
+        }
+        const instance = new freighterApi.WatchWalletChanges(DEFAULT_FREIGHTER_WATCH_INTERVAL_MS);
+        watcher = instance;
+        instance.watch(({ network, networkPassphrase, error }) => {
+          if (error || !networkPassphrase) {
+            return;
+          }
+          const previous = lastPassphrase;
+          lastPassphrase = networkPassphrase;
+          if (previous !== undefined && previous !== networkPassphrase) {
+            listener({ network, networkPassphrase });
+          }
+        });
+      })
+      .catch(() => {
+        // Freighter is unavailable; there are no network changes to watch.
+      });
+
+    return () => {
+      stopped = true;
+      watcher?.stop();
+    };
+  }
+
   async getPublicKey(): Promise<string> {
-    const freighterApi = await loadFreighterApi();
+    const freighterApi = await this.loadInjectedFreighterApi();
     const { address, error } = await freighterApi.getAddress();
     if (error) {
       throw new Error(error.message);
@@ -422,7 +752,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
     const publicKey = await this.getPublicKey();
     this.session = {
       token: publicKey,
-      expiresAt: Date.now() + DEFAULT_SESSION_TTL_MS,
+      expiresAt: Date.now() + this.sessionTtlMs,
     };
     return this.session;
   }
@@ -440,7 +770,7 @@ export class FreighterWalletAdapter implements WalletAdapter {
     // Kicked off synchronously (not awaited yet) so the timeout below is
     // still registered before this function's first `await`, regardless of
     // how long the dynamic import takes to resolve.
-    const freighterApiPromise = loadFreighterApi();
+    const freighterApiPromise = this.loadInjectedFreighterApi();
 
     // Race the Freighter call against a timer so that a hung or dismissed
     // popup never leaves the caller's promise pending
@@ -489,8 +819,15 @@ export class WalletConnectWalletAdapter implements WalletAdapter {
         opts: SignTransactionOptions,
       ): Promise<string | SignatureResponse>;
       getNetwork?(): Promise<{ network: string; networkPassphrase: string }>;
+      onNetworkChange?(listener: WalletNetworkChangeListener): () => void;
     },
-  ) {}
+  ) {
+    if (connector.onNetworkChange) {
+      this.onNetworkChange = (listener) => connector.onNetworkChange!(listener);
+    }
+  }
+
+  onNetworkChange?: (listener: WalletNetworkChangeListener) => () => void;
 
   isConnected(): Promise<boolean> {
     return this.connector.isConnected();
@@ -535,6 +872,7 @@ export const freighterAdapter: WalletAdapter = {
   getPublicKey: () => defaultFreighterWalletAdapter.getPublicKey(),
   signTransaction: (xdr: string, opts: SignTransactionOptions) => defaultFreighterWalletAdapter.signTransaction(xdr, opts),
   getNetwork: () => defaultFreighterWalletAdapter.getNetwork(),
+  onNetworkChange: (listener: WalletNetworkChangeListener) => defaultFreighterWalletAdapter.onNetworkChange(listener),
 };
 
 export function getDefaultWalletAdapter(): WalletAdapter {

@@ -88,8 +88,9 @@ export enum WillErrorCode {
  * A single beneficiary entry: an address and the percentage of the will's
  * balance it is entitled to receive when the inheritance is released.
  *
- * `percentage` is on a 0-100 scale (a positive integer), and a will's
- * beneficiary percentages must sum to exactly 100. The SDK converts this to
+ * `percentage` is on a 0-100 scale (a positive number — integers and
+ * reasonable fractional values like `33.33` are both accepted), and a will's
+ * beneficiary percentages must sum to 100. The SDK converts this to
  * the contract's internal basis-point representation (0-10,000, summing to
  * 10,000) when submitting a transaction, so a `percentage` of `30` is bound
  * on-chain as `3000` basis points.
@@ -102,16 +103,49 @@ export enum WillErrorCode {
  *
  * @since 0.1.0
  */
+/**
+ * A single beneficiary of a will, with their Stellar address and percentage
+ * share of the will's balance.
+ *
+ * ## Validation constraints
+ * - `address` must be a valid Stellar public key (StrKey encoded, `G` prefix).
+ *   Use {@link StrKey.isValidEd25519PublicKey} from `@stellar/stellar-sdk` to
+ *   validate client-side before submission.
+ * - `percentage` must be an integer in the range 0–100 (inclusive).
+ * - Across all beneficiaries in a single will, percentages must sum to exactly
+ *   100.
+ *
+ * These constraints are enforced client-side by {@link validateBeneficiaries}
+ * (called by {@link SoroWillClient.createWill} and
+ * {@link SoroWillClient.updateBeneficiaries}) and by the on-chain contract
+ * (error codes {@link WillErrorCode.InvalidPercentage} and
+ * {@link WillErrorCode.InvalidPercentages}).
+ *
+ * @example
+ * ```ts
+ * const beneficiary: Beneficiary = {
+ *   address: 'GA3JE5IXBSOR6DCLZSGN7JIWQWO45RCS7PUFKKVXWSTE4Y75ISIDMHJG',
+ *   percentage: 60,
+ * };
+ * ```
+ *
+ * @since 0.1.0
+ */
 export interface Beneficiary {
   /**
-   * Stellar address of the beneficiary.
+   * Stellar address of the beneficiary. Must be a valid Ed25519 public key
+   * encoded as a StrKey string (e.g. `GA3JE5IXBSOR6DCLZSGN7JIWQWO45RCS7PUFKKVXWSTE4Y75ISIDMHJG`).
+   *
+   * @example 'GA3JE5IXBSOR6DCLZSGN7JIWQWO45RCS7PUFKKVXWSTE4Y75ISIDMHJG'
    * @since 0.1.0
    */
-  address: string;
+  readonly address: string;
   /**
    * Share of the will's balance this beneficiary receives, expressed as a
    * whole percentage on the 0–100 scale. All beneficiary percentages in a
    * will must sum to exactly 100.
+   *
+   * **Constraint**: must be an integer between 0 and 100 (inclusive).
    *
    * **Breaking change in 0.1.1:** prior to 0.1.1 this field was named
    * `basisPoints` and stored the raw on-chain value (0–10 000). It was
@@ -119,9 +153,10 @@ export interface Beneficiary {
    * public semantics. If you stored beneficiary objects from SDK < 0.1.1,
    * divide each saved value by 100 to convert.
    *
+   * @example 60
    * @since 0.1.1
    */
-  percentage: number;
+  readonly percentage: number;
 }
 
 /**
@@ -187,22 +222,22 @@ export interface Will {
    * Unique identifier for this will, as a decimal string (contract-side `u64`).
    * @since 0.1.0
    */
-  id: string;
+  readonly id: string;
   /**
    * The address that created and funds the will.
    * @since 0.1.0
    */
-  owner: string;
+  readonly owner: string;
   /**
    * The token contract address (e.g. a USDC Stellar Asset Contract) held by the will.
    * @since 0.1.0
    */
-  token: string;
+  readonly token: string;
   /**
    * The amount of `token` currently locked, in base units, as a decimal string.
    * @since 0.1.0
    */
-  balance: string;
+  readonly balance: string;
   /**
    * The beneficiaries and their percentage shares (0-100 scale). Always sums
    * to 100. On-chain these are stored as basis points summing to 10,000; the
@@ -213,27 +248,27 @@ export interface Will {
    * migrate.
    * @since 0.1.0
    */
-  beneficiaries: Beneficiary[];
+  readonly beneficiaries: readonly Beneficiary[];
   /**
    * How many days the owner may go without checking in before the will can be triggered.
    * @since 0.1.0
    */
-  checkinPeriodDays: number;
+  readonly checkinPeriodDays: number;
   /**
    * How many days after being triggered the owner has to prove they are alive.
    * @since 0.1.0
    */
-  gracePeriodDays: number;
+  readonly gracePeriodDays: number;
   /**
    * When the owner last checked in.
    * @since 0.1.0
    */
-  lastCheckin: Date;
+  readonly lastCheckin: Date;
   /**
    * When the will was triggered, or `null` if it has never been triggered.
    * @since 0.1.0
    */
-  triggerTime: Date | null;
+  readonly triggerTime: Date | null;
   /**
    * Current lifecycle state of the will.
    *
@@ -242,43 +277,43 @@ export interface Will {
    * switch/if-chain over `WillStatus`, add handling for these new values.
    * @since 0.1.0
    */
-  status: WillStatus;
+  readonly status: WillStatus;
   /**
    * Optional guardian addresses (up to 3) who may force an early release.
    * @since 0.1.0
    */
-  guardians: string[];
+  readonly guardians: readonly string[];
   /**
    * Number of distinct guardians who have voted in the current release cycle.
    * @since 0.1.0
    */
-  guardianVotes: number;
+  readonly guardianVotes: number;
 }
 
 /** Parameters for {@link SoroWillClient.createWill}. */
 export interface CreateWillParams {
   /** The token contract address (e.g. a USDC Stellar Asset Contract) to lock. */
-  token: string;
+  readonly token: string;
   /** The amount of `token` to lock, in base units, as a decimal string. */
-  amount: string;
+  readonly amount: string;
   /**
    * 1 to 10 beneficiaries whose `percentage` values (0-100 scale) sum to
    * exactly 100. The SDK scales these to basis points (summing to 10,000)
    * before submitting to the contract.
    */
-  beneficiaries: Beneficiary[];
+  readonly beneficiaries: readonly Beneficiary[];
   /** How many days the owner may go without checking in. */
-  checkinPeriodDays: number;
+  readonly checkinPeriodDays: number;
   /** How many days after being triggered the owner has to prove they are alive. */
-  gracePeriodDays: number;
+  readonly gracePeriodDays: number;
   /** 0 to 3 guardian addresses that may jointly force an early release. */
-  guardians: string[];
+  readonly guardians: readonly string[];
 }
 
 /** Parameters for {@link SoroWillClient.updateBeneficiaries}. */
 export interface UpdateBeneficiariesParams {
-  willId: string;
-  beneficiaries: Beneficiary[];
+  readonly willId: string;
+  readonly beneficiaries: readonly Beneficiary[];
 }
 
 /** Optional client-side pagination controls for list-style SDK methods. */
@@ -291,8 +326,8 @@ export interface PaginationOptions {
 
 /** A page of wills plus the cursor needed to fetch the next page, if any. */
 export interface PaginatedWillsResult {
-  wills: Will[];
-  nextCursor: string | null;
+  readonly wills: Will[];
+  readonly nextCursor: string | null;
 }
 
 
@@ -314,9 +349,37 @@ export type TransactionSigner<T = void> = (
 
 /* … truncated 2578 chars — edit only what you need near the top … */
 
+/**
+ * A single contract invocation to be executed as part of a batch.
+ *
+ * ### Networks (#550)
+ *
+ * `network` is optional. When present it declares which Stellar network the
+ * operation is intended for (`'testnet'` or `'mainnet'`). Every operation in
+ * a batch must agree on the same network, and that network must match the
+ * client's configured network:
+ *
+ * - Operations that omit `network` inherit the client's network and are
+ *   therefore always compatible with it.
+ * - If any operation specifies a network that differs from the client's
+ *   network, or if two operations specify *different* networks, the batch is
+ *   rejected with a {@link BatchNetworkMismatchError} before any transaction
+ *   is built, signed, or submitted.
+ *
+ * This prevents a batch from silently mixing testnet and mainnet operations,
+ * which would otherwise fail (or, worse, succeed against the wrong network)
+ * deep inside the signing flow.
+ */
 export interface BatchOperation {
+  /** The contract method to invoke (e.g. `'create_will'`). */
   method: string;
+  /** The arguments to the method as a record of name-value pairs. */
   args: Record<string, unknown>;
+  /**
+   * The Stellar network this operation targets. Omit to inherit the client's
+   * configured network.
+   */
+  network?: 'testnet' | 'mainnet';
 }
 
 export interface BatchResult {
@@ -324,30 +387,126 @@ export interface BatchResult {
   error?: Error;
 }
 
+/**
+ * Outcome of one operation in a {@link SoroWillClient.batchSequential} queue.
+ *
+ * - `success` — the operation's transaction landed.
+ * - `failed` — the operation failed after all permitted retries.
+ * - `skipped` — the operation was never submitted because an earlier
+ *   operation failed (with `onFailure: 'stop'`) or the request was aborted.
+ */
+export type BatchOperationStatus = 'success' | 'failed' | 'skipped';
+
+export interface BatchOperationResult {
+  /** Position of the operation in the submitted queue. */
+  index: number;
+  method: string;
+  status: BatchOperationStatus;
+  /** Transaction hash, present when `status` is `'success'`. */
+  txHash?: string;
+  /** Why the operation failed or was skipped. */
+  error?: Error;
+  /** Number of submission attempts made (0 for skipped operations). */
+  attempts: number;
+}
+
+export interface BatchQueueOptions extends RequestOptions {
+  /**
+   * What to do with the remaining operations after one fails:
+   * - `'stop'` (default) — mark every remaining operation `skipped` without
+   *   submitting it, since it may depend on state the failed operation
+   *   should have produced.
+   * - `'continue'` — keep submitting the remaining operations.
+   */
+  onFailure?: 'stop' | 'continue';
+  /**
+   * How many times to retry a failed operation before marking it `failed`.
+   * Contract errors and wallet network mismatches are deterministic and are
+   * never retried. Defaults to `0`.
+   */
+  maxRetries?: number;
+}
+
+export interface BatchQueueResult {
+  /** `true` only if every operation succeeded. */
+  success: boolean;
+  /** One entry per submitted operation, in queue order. */
+  results: BatchOperationResult[];
+  succeededCount: number;
+  failedCount: number;
+  skippedCount: number;
+}
+
 export interface RequestOptions {
   signal?: AbortSignal;
   retries?: number;
   timeout?: number;
   timeoutMs?: number;
+  /**
+   * When `true`, skips the client-side will-existence pre-check (e.g.
+   * `getWill()`) before submitting a state-changing transaction. Use only when
+   * the caller has already confirmed the will exists, to avoid an extra RPC
+   * round-trip. Methods that require the will's on-chain state for their
+   * return value (e.g. `checkIn`'s `nextDeadline`) may return a best-effort
+   * value when this is set.
+   * @default false
+   */
+  skipExistenceCheck?: boolean;
+}
+
+/** Options for emergency check-in, optionally providing guardian signatures. */
+export interface EmergencyCheckInOptions extends RequestOptions {
+  /** Optional guardian signature approving the emergency check-in. */
+  guardianSignature?: string;
+  /** Optional list of guardian signatures approving the emergency check-in. */
+  guardianSignatures?: string[];
 }
 
 export interface SoroWillEvent {
-  id: string;
-  type: string;
-  cursor: string;
-  ledger: number | null;
-  ledgerClosedAt: Date | null;
-  contractId: string;
-  txHash: string | null;
-  topics: unknown[];
-  value: unknown;
-  raw: unknown;
+  readonly id: string;
+  readonly type: string;
+  readonly cursor: string;
+  readonly ledger: number | null;
+  readonly ledgerClosedAt: Date | null;
+  readonly contractId: string;
+  readonly txHash: string | null;
+  readonly topics: readonly unknown[];
+  readonly value: unknown;
+  readonly raw: unknown;
 }
 
+/**
+ * A handle to an active event subscription.
+ *
+ * ### Handler semantics (#548)
+ *
+ * A subscription has **exactly one** handler: the `listener` passed to
+ * `subscribeToEvents()`. The type does not allow adding further handlers
+ * after the fact — there is no `addHandler()`/`on()` method.
+ *
+ * - **Exclusivity**: one subscription delivers each event to one listener
+ *   only. Events are never fanned out to multiple handlers of the same
+ *   subscription. If you need several consumers, call
+ *   `subscribeToEvents()` once per consumer and give each subscription its own
+ *   listener; each subscription then receives its own copy of the stream.
+ * - **Ordering**: events are delivered to the listener in the order the
+ *   network produced them — ascending ledger sequence, and within a ledger,
+ *   ascending event order. Delivery is strictly sequential: the next event is
+ *   not dispatched until the listener for the previous one has returned.
+ * - **Error isolation**: if the listener throws, the failure is contained to
+ *   that single event. The subscription stays open, the remaining events in
+ *   the same batch are still delivered, and the error is reported through
+ *   `EventSubscriptionOptions.onError`. This holds for both the WebSocket and
+ *   the polling transport.
+ */
 export interface EventSubscription {
+  /** Stops the subscription. Safe to call more than once. */
   unsubscribe(): void;
+  /** Alias for {@link EventSubscription.unsubscribe}. */
   close(): void;
+  /** The transport actually in use, once the subscription has been established. */
   transport?: EventSubscriptionTransport;
+  /** Whether the subscription has been closed. */
   closed?: boolean;
 }
 

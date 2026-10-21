@@ -23,9 +23,13 @@ import {
 } from './events';
 import type {
   BatchOperation,
+  BatchOperationResult,
+  BatchQueueOptions,
+  BatchQueueResult,
   BatchResult,
   Beneficiary,
   CreateWillParams,
+  EmergencyCheckInOptions,
   EventSubscription,
   EventSubscriptionOptions,
   PaginatedWillsResult,
@@ -37,17 +41,22 @@ import type {
 } from './types';
 import { WillStatus } from './types';
 import {
+  assertWalletSessionActive,
   getDefaultWalletAdapter,
   normalizeSignatureResponse,
+  type SignatureResponse,
   type WalletAdapter,
 } from './wallet';
 import {
   AccountNotFundedError,
+  BatchNetworkMismatchError,
   BeneficiaryValidationError,
   GuardianValidationError,
+  CheckinPeriodExceedsTtlError,
   InvalidDayCountError,
   InvalidContractIdError,
   InvalidCursorError,
+  InvalidGuardianSignatureError,
   InvalidPaginationOptionsError,
   InvokeFailedError,
   RequestTimeoutError,
@@ -57,22 +66,22 @@ import {
   SoroWillInvalidAmountError,
   SoroWillRestoreRequiredError,
   TooManyGuardiansError,
+  TooManyIdsError,
   UnsupportedBatchSizeError,
   WalletNetworkMismatchError,
+  WillContractError,
   WebSocketNotConfiguredError,
+  WillNotFoundError,
 } from './errors';
-import { hasDuplicateBeneficiaries, MAX_GUARDIANS, validateBeneficiaries } from './utils';
+import { deepFreezeObject, hasDuplicateBeneficiaries, MAX_GUARDIANS, validateBeneficiaries } from './utils';
 import { RequestQueue } from './requestQueue';
 import { InFlightTracker } from './inFlightTracker';
 import { RpcEndpointPool } from './rpc';
 import { buildSep7TxUri, type BuildSep7TxUriOptions } from './sep7';
 import { HookManager } from './hooks';
 import type { BeforeInvokeContext, AfterInvokeContext } from './hooks';
-import {
-  assertPreparedTransactionMatchesIntendedOperation,
-  assertSupportedSignatureAlgorithm,
-} from './txValidation';
-import { DebugLogger } from './debugLogger';
+import { assertPreparedTransactionMatchesIntendedOperation } from './txValidation';
+import { DebugLogger, type DebugLoggerOptions } from './debugLogger';
 
 /** @internal Local alias for Soroban's `xdr.ScVal`; not part of the public API. */
 type ScVal = xdr.ScVal;
@@ -330,13 +339,40 @@ export interface SoroWillClientOptions {
   /** Maximum RPC requests started in a rolling one-second window. Defaults to 10. */
   requestsPerSecond?: number;
   /**
-   * Maximum number of concurrent state-changing operations a single wallet
-   * address may have in flight through this client's tracker. Defaults to 10.
-   * Ignored when a custom `inFlightTracker` is supplied (configure it there).
+   * Maximum number of RPC requests allowed to wait in the client's request
+   * queue at once. Defaults to 1000. Requests enqueued while the queue is
+   * full are rejected with a `RequestQueueOverflowError` instead of growing
+   * the queue without bound (#525).
    */
-  maxConcurrentPerWallet?: number;
+  maxQueueSize?: number;
   /** Optional list of RPC endpoints to use with automatic failover. */
   rpcUrls?: string[];
+  /**
+   * When `true`, query methods (`getWill`, `getWillsByOwner`,
+   * `getWillsByBeneficiary`) return deeply frozen objects so callers cannot
+   * accidentally mutate internal SDK state. Defaults to `false`.
+   *
+   * When `true`, each returned `Will` (and its nested `beneficiaries`,
+   * `guardians`, `lastCheckin`, `triggerTime`, etc.) is frozen via
+   * `Object.freeze()` at every depth. Any attempt to reassign a property
+   * throws a `TypeError` in strict mode.
+   *
+   * @example
+   * ```ts
+   * import { SoroWillClient } from '@sorowill/sdk';
+   *
+   * const client = new SoroWillClient({
+   *   network: 'testnet',
+   *   contractId: 'CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE',
+   *   deepFreeze: true,
+   * });
+   *
+   * const will = await client.getWill('1');
+   * will.balance = '999999'; // Throws: Cannot assign to read only property
+   * will.beneficiaries[0].percentage = 99; // Throws
+   * ```
+   */
+  deepFreeze?: boolean;
   /**
    * Maximum number of poll attempts for transaction finality.
    * Defaults to 30. Increase under mainnet congestion.
@@ -348,6 +384,12 @@ export interface SoroWillClientOptions {
    * Defaults to false (opt-in only).
    */
   debug?: boolean;
+  /**
+   * Controls redaction of sensitive fields in debug logs. Redaction is on by
+   * default; pass extra field names via `redactKeys` to extend
+   * {@link DEFAULT_REDACTED_KEYS}.
+   */
+  debugLoggerOptions?: DebugLoggerOptions;
   /**
    * If a transaction doesn't land within the poll window, automatically
    * rebuild and resubmit with a higher fee instead of throwing.
@@ -367,6 +409,13 @@ export interface SoroWillClientOptions {
    * `buildInvocationTransaction()` call made by this client.
    */
   transactionTimeoutSeconds?: number;
+  /**
+   * When `true`, every state-changing operation refuses to proceed if the
+   * wallet adapter cannot report its network (i.e. it does not implement
+   * `getNetwork`). Defaults to `false`, in which case such wallets are not
+   * checked and the network is only verified for adapters that can report it.
+   */
+  requireWalletNetwork?: boolean;
 }
 
 /** The raw, snake_case shape of a `Will` as decoded straight off the contract spec. */
@@ -386,6 +435,16 @@ interface RawWill {
 }
 
 const DEFAULT_POLL_ATTEMPTS = 30;
+
+/**
+ * Contract methods for which two concurrent invocations targeting the same
+ * will must never both be submitted — each would send its own transaction
+ * on-chain. Invocations of these methods are registered through
+ * {@link InFlightTracker.trackExclusive}, so a duplicate arriving while the
+ * first is still in flight is rejected with a `DuplicateOperationError`
+ * instead of silently issuing a second transaction (#523).
+ */
+const EXCLUSIVE_INVOKE_METHODS: ReadonlySet<string> = new Set(['check_in']);
 
 /**
  * How long `subscribeToEvents` waits for a WebSocket to fire `onopen` before
@@ -537,13 +596,42 @@ function sortWillsById(wills: Will[]): Will[] {
  */
 const PERCENT_TO_BASIS_POINTS = 100;
 
+/**
+ * Total beneficiary share expected on-chain, in basis points (100% = 10_000).
+ * The SDK accepts whole percentages (0-100 scale) and scales them by
+ * {@link PERCENT_TO_BASIS_POINTS}; the scaled total must equal this value or
+ * the contract rejects the transaction with `InvalidPercentages`.
+ */
+const TOTAL_BASIS_POINTS = 10_000;
+
+/**
+ * Maximum `checkinPeriodDays` accepted by {@link SoroWillClient.createWill}.
+ *
+ * The will ledger entry must stay live until its check-in deadline or it is
+ * archived and can no longer be triggered without a manual restore. Soroban
+ * persistent entries live at most ~1 year of ledgers without a TTL extension
+ * bump, so the check-in deadline (which is the only thing keeping the entry
+ * alive via periodic `check_in` calls) must fall inside that window. The cap
+ * is set conservatively below a full year (365 days) to leave headroom for
+ * ledger-close variance.
+ *
+ * **IMPORTANT**: mirrors the contract-side maximum period validated in
+ * `contracts/will/src/lib.rs` (`InvalidPeriod`); keep in sync manually.
+ *
+ * @since 0.1.2
+ */
+export const MAX_CHECKIN_PERIOD_DAYS = 365 - 30;
+
 /** Maps SDK beneficiaries (0-100 `percentage`) to the contract's `{ address, basis_points }` shape. */
 function toContractBeneficiaries(
-  beneficiaries: Beneficiary[],
+  beneficiaries: readonly Beneficiary[],
 ): Array<{ address: string; basis_points: number }> {
   return beneficiaries.map((beneficiary) => ({
     address: beneficiary.address,
-    basis_points: beneficiary.percentage * PERCENT_TO_BASIS_POINTS,
+    // Math.round strips binary floating-point artifacts (e.g. 0.1 * 100 is
+    // 10.000000000000002) so the emitted basis points are always integers
+    // that still sum to exactly 10,000 when validation accepted the list.
+    basis_points: Math.round(beneficiary.percentage * PERCENT_TO_BASIS_POINTS),
   }));
 }
 
@@ -640,7 +728,7 @@ function normalizePositiveInteger(value: number | undefined, label: string): num
 function validateAmount(amount: string): bigint {
   // Only decimal digit strings with no leading minus or decimals are valid.
   // Must be at least one character, all digits, and the parsed value > 0.
-  if (!/^\d+$/.test(amount)) {
+  if (typeof amount !== 'string' || !/^\d+$/.test(amount)) {
     throw new SoroWillInvalidAmountError(amount);
   }
   const value = BigInt(amount);
@@ -685,6 +773,48 @@ function validateDays(value: number, paramName: string): bigint {
   return BigInt(value);
 }
 
+/**
+ * Validates `checkinPeriodDays` against the contract storage TTL window.
+ * Runs after {@link validateDays} so non-positive / fractional values still
+ * surface as {@link InvalidDayCountError}; only in-range-but-unsafe values
+ * throw {@link CheckinPeriodExceedsTtlError}.
+ *
+ * @since 0.1.2
+ */
+function validateCheckinPeriodDays(value: number): bigint {
+  const days = validateDays(value, 'checkinPeriodDays');
+  if (value > MAX_CHECKIN_PERIOD_DAYS) {
+    throw new CheckinPeriodExceedsTtlError(value, MAX_CHECKIN_PERIOD_DAYS);
+  }
+  return days;
+}
+
+/**
+ * Validates that SDK beneficiaries (whole percentages, 0-100 scale) scale
+ * cleanly to the contract's basis points and total exactly 100% (10_000 bp).
+ * Throws {@link BeneficiaryValidationError} naming the scaled total when the
+ * on-chain sum would be short (e.g. 0 after per-entry rounding) or otherwise
+ * off — catching it here avoids a wasted signing round-trip that the contract
+ * would reject with `InvalidPercentages`.
+ *
+ * Assumes structural validation (count, addresses, positive integers)
+ * already passed via {@link validateBeneficiaries}.
+ *
+ * @since 0.1.2
+ */
+function assertBeneficiaryBasisPointsTotal(beneficiaries: Beneficiary[], method: string): void {
+  const totalBp = beneficiaries.reduce(
+    (acc, b) => acc + b.percentage * PERCENT_TO_BASIS_POINTS,
+    0,
+  );
+  if (totalBp !== TOTAL_BASIS_POINTS) {
+    throw new BeneficiaryValidationError(
+      `Invalid beneficiaries for ${method}: percentages scale to ${totalBp} basis points ` +
+        `but must total exactly ${TOTAL_BASIS_POINTS} (100%).`,
+    );
+  }
+}
+
 function getDefaultEnv(): EnvSource {
   if (typeof process !== 'undefined' && process.env) {
     return process.env as EnvSource;
@@ -709,7 +839,7 @@ export class SoroWillClient {
   private readonly pollAttempts: number;
   private readonly specOverride: ContractSpecLike | Promise<ContractSpecLike> | undefined;
   private readonly specJsonOverride: Uint8Array | undefined;
-  private readonly eventSubscription?: WillEventSubscription;
+  private eventSubscription?: WillEventSubscription | undefined;
   private readonly eventRpcUrl: string;
   private readonly eventStreamUrl: string | undefined;
   private readonly defaultPollIntervalMs: number;
@@ -740,6 +870,7 @@ export class SoroWillClient {
   private readonly debugLogger: DebugLogger;
   private readonly autoFeeBumpOnTimeout: boolean;
   private readonly transactionTimeoutSeconds: number;
+  private readonly deepFreeze: boolean;
   /**
    * How long (in milliseconds) the lazily-fetched contract spec is considered
    * fresh. After this TTL elapses the next call will re-fetch the spec from the
@@ -751,6 +882,15 @@ export class SoroWillClient {
    * not subject to TTL expiry.
    */
   private readonly specCacheTtlMs: number;
+  /**
+   * Tracks hashes of transactions that have been signed by this client to
+   * prevent duplicate signing (and thus duplicate submissions) of the same
+   * transaction (#573). A transaction's hash is determined by its contents
+   * (source account, sequence number, operations, fee, timeout) and is
+   * identical before and after signing, so we can detect duplicates prior to
+   * sending the signed envelope to the wallet.
+   */
+  private readonly signedTransactionHashes: Set<string>;
 
   constructor(options: SoroWillClientOptions) {
     const config = NETWORK_CONFIG[options.network];
@@ -772,6 +912,7 @@ export class SoroWillClient {
     this.network = options.network;
     this.hooks = options.hooks ?? new HookManager();
     this.wallet = options.wallet ?? getDefaultWalletAdapter();
+    this.requireWalletNetwork = options.requireWalletNetwork ?? false;
     this.pollAttempts = options.pollAttempts ?? DEFAULT_POLL_ATTEMPTS;
     if (!Number.isInteger(this.pollAttempts) || this.pollAttempts <= 0) {
       throw new RangeError('pollAttempts must be a positive integer');
@@ -799,18 +940,18 @@ export class SoroWillClient {
       ...(options.requestsPerSecond === undefined
         ? {}
         : { requestsPerSecond: options.requestsPerSecond }),
+      ...(options.maxQueueSize === undefined
+        ? {}
+        : { maxQueueSize: options.maxQueueSize }),
     });
     this.inFlightTracker =
       options.inFlightTracker ??
       // Default: a private tracker scoped to this contract's address so that
       // different client instances targeting different contracts never share a
       // dedup entry for the same (willId, method) pair (#503).
-      new InFlightTracker({
-        scopeId: options.contractId,
-        ...(options.maxConcurrentPerWallet === undefined
-          ? {}
-          : { maxConcurrentPerWallet: options.maxConcurrentPerWallet }),
-      });
+      new InFlightTracker(options.contractId);
+    // #573: Track signed transaction hashes to prevent duplicate signing.
+    this.signedTransactionHashes = new Set();
     this.readCache = options.readCache === false ? undefined : new ReadCache(options.readCache);
     this.retryOptions = { ...DEFAULT_RETRY_OPTIONS, ...options.retry };
     const { maxAttempts, initialDelayMs, maxDelayMs, backoffFactor } = this.retryOptions;
@@ -827,12 +968,13 @@ export class SoroWillClient {
       throw new RangeError('retry.backoffFactor must be a finite number of at least 1');
     }
     this.debug = options.debug ?? false;
-    this.debugLogger = new DebugLogger(this.debug);
+    this.debugLogger = new DebugLogger(this.debug, options.debugLoggerOptions);
     this.autoFeeBumpOnTimeout = options.autoFeeBumpOnTimeout ?? false;
     this.transactionTimeoutSeconds = options.transactionTimeoutSeconds ?? 30;
     if (!Number.isFinite(this.transactionTimeoutSeconds) || this.transactionTimeoutSeconds <= 0) {
       throw new RangeError('transactionTimeoutSeconds must be a finite number greater than zero');
     }
+    this.deepFreeze = options.deepFreeze ?? false;
 
     this.specCacheTtlMs = options.specCacheTtlMs ?? Infinity;
     if (this.specCacheTtlMs !== Infinity && (!Number.isFinite(this.specCacheTtlMs) || this.specCacheTtlMs <= 0)) {
@@ -840,6 +982,14 @@ export class SoroWillClient {
     }
 
     this.feeStatsCache = new Map();
+
+    // Scope cached reads to the configured network, and drop them whenever the
+    // wallet reports a network switch so testnet data is never served after
+    // switching to mainnet (or vice versa) (#603).
+    this.readCache?.setNetwork(this.networkPassphrase);
+    this.stopWatchingWalletNetwork = this.wallet.onNetworkChange?.(({ networkPassphrase }) => {
+      this.handleNetworkChange(networkPassphrase);
+    });
 
     if (this.readCache && options.eventSource) {
       // Subscribe and automatically clean up the listener if setup throws.
@@ -874,6 +1024,11 @@ export class SoroWillClient {
   /**
    * Constructs a client from environment variables.
    *
+   * **Operation Type:** Read-only (Factory)
+   *
+   * @readonly
+   * @remarks Factory method that constructs a client instance without modifying ledger state or submitting transactions.
+   *
    * Expected variables:
    * - `SOROWILL_NETWORK`
    * - `SOROWILL_CONTRACT_ID`
@@ -883,8 +1038,16 @@ export class SoroWillClient {
    * - `SOROWILL_EVENT_STREAM_URL` (optional)
    * - `SOROWILL_EVENTS_POLL_INTERVAL_MS` (optional)
    *
+   * @param env - Optional environment object (defaults to `process.env`).
+   * @returns A new configured `SoroWillClient` instance.
    * @throws {Error} If `SOROWILL_NETWORK` is not `"testnet"` or `"mainnet"`.
    * @throws {Error} If `SOROWILL_CONTRACT_ID` is not set.
+   *
+   * @example
+   * ```ts
+   * // Loads settings from environment variables:
+   * const client = SoroWillClient.fromEnv();
+   * ```
    */
   static fromEnv(env: EnvSource = getDefaultEnv()): SoroWillClient {
     const network = env.SOROWILL_NETWORK;
@@ -918,6 +1081,11 @@ export class SoroWillClient {
   /**
    * Convenience constructor that targets a known network using the
    * **maintainer-managed default contract address** for that network.
+   *
+   * **Operation Type:** Read-only (Factory)
+   *
+   * @readonly
+   * @remarks Factory method that constructs a client instance targeting a standard network without modifying ledger state.
    *
    * This is the recommended way to get started quickly. Any option accepted
    * by the `SoroWillClient` constructor can be passed as `overrides` —
@@ -979,12 +1147,32 @@ export class SoroWillClient {
   /**
    * Locks `params.amount` of `params.token` and creates a new will.
    *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks State-changing write operation. Builds, signs, and submits an on-chain transaction that modifies
+   * ledger state to create a new inheritance will. Requires a connected wallet to sign and consumes transaction fees.
+   *
+   * @param params - Configuration parameters for creating the will.
+   * @param options - Optional request timeout and signal options.
    * @returns The newly created will's ID and the transaction hash.
    * @throws {SoroWillError} If the transaction simulation fails or returns no result.
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
    * @throws {WillContractError} Mapped contract-level errors (e.g. InvalidPercentagesError,
    *   TooManyBeneficiariesError, ZeroAmountError).
    * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const { willId, txHash } = await client.createWill({
+   *   token: 'CDLZ...',
+   *   amount: '10000000',
+   *   beneficiaries: [{ address: 'GBEN...', percentage: 100 }],
+   *   checkinPeriodDays: 90,
+   *   gracePeriodDays: 14,
+   *   guardians: [],
+   * });
+   * console.log(`Created will ${willId} in transaction ${txHash}`);
+   * ```
    */
   async createWill(
     params: CreateWillParams,
@@ -995,9 +1183,10 @@ export class SoroWillClient {
     }
     if (!validateBeneficiaries(params.beneficiaries)) {
       throw new BeneficiaryValidationError(
-        'Invalid beneficiaries: list must be 1–10 entries, every percentage must be a positive integer, and percentages must sum to exactly 100.',
+        'Invalid beneficiaries: list must be 1–10 entries, every percentage must be a positive number, and percentages must sum to 100.',
       );
     }
+    assertBeneficiaryBasisPointsTotal(params.beneficiaries, 'createWill');
     // #156: Validate guardians count synchronously before any RPC round-trip.
     if (params.guardians.length > MAX_GUARDIANS) {
       throw new TooManyGuardiansError(params.guardians.length, MAX_GUARDIANS);
@@ -1005,6 +1194,9 @@ export class SoroWillClient {
     if (!StrKey.isValidContract(params.token)) {
       throw new InvalidContractIdError(params.token);
     }
+    // #537: fail fast when the check-in deadline would outlive the will
+    // entry's storage TTL (archived before it can be triggered).
+    validateCheckinPeriodDays(params.checkinPeriodDays);
     const owner = await this.getWalletPublicKey();
     const seenGuardians = new Set<string>();
     for (const guardian of params.guardians) {
@@ -1026,7 +1218,7 @@ export class SoroWillClient {
         token: params.token,
         amount: validateAmount(params.amount),
         beneficiaries: toContractBeneficiaries(params.beneficiaries),
-        checkin_period_days: validateDays(params.checkinPeriodDays, 'checkinPeriodDays'),
+        checkin_period_days: validateCheckinPeriodDays(params.checkinPeriodDays),
         grace_period_days: validateDays(params.gracePeriodDays, 'gracePeriodDays'),
         guardians: params.guardians,
       },
@@ -1047,7 +1239,20 @@ export class SoroWillClient {
     return { willId, txHash };
   }
 
-  /** Resets the check-in countdown for `willId`. */
+  /**
+   * Resets the check-in countdown for `willId`.
+   *
+   * Before submitting, the will's existence is validated via `getWill()`
+   * unless `options.skipExistenceCheck` is `true`. If the will does not
+   * exist, a {@link WillNotFoundError} is thrown before any transaction is
+   * built, avoiding wasted gas and fees.
+   *
+   * @returns The transaction hash and the next check-in deadline.
+   * @throws {SoroWillError} If the transaction simulation/submission fails.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   * @throws {WillNotFoundError} If the will does not exist and `skipExistenceCheck` is not set.
+   * @throws {Error} If the wallet is not connected or fails to sign.
+   */
   async checkIn(
     willId: string,
     options?: RequestOptions,
@@ -1058,7 +1263,12 @@ export class SoroWillClient {
     // checkin_period_days is a stored will property not returned by the
     // contract's check_in function, so a separate getWill() read is
     // unavoidable in order to compute the nextDeadline return value.
-    const will = await this.getWill(willId, options);
+    // This read also validates will existence, throwing WillNotFoundError
+    // if the will is not found — before any gas is spent.
+    let will: Awaited<ReturnType<typeof this.getWill>> | null = null;
+    if (!options?.skipExistenceCheck) {
+      will = await this.getWill(willId, options);
+    }
     const { txHash, createdAt } = await this.invoke(
       'check_in',
       { will_id: parseWillId(willId), owner },
@@ -1066,19 +1276,35 @@ export class SoroWillClient {
     );
     return {
       txHash,
-      nextDeadline: new Date((createdAt + will.checkinPeriodDays * 86_400) * 1000),
+      nextDeadline: will
+        ? new Date((createdAt + will.checkinPeriodDays * 86_400) * 1000)
+        : new Date(createdAt * 1000),
     };
   }
 
   /**
    * Starts the grace period for `willId` once the check-in deadline has passed.
    *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks State-changing write operation. Builds, signs, and submits an on-chain transaction that modifies
+   * ledger state to transition the will from Active to Triggered. Requires a connected wallet to sign and consumes
+   * transaction fees.
+   *
+   * @param willId - The identifier of the will to trigger.
+   * @param options - Optional request options.
    * @returns The transaction hash.
    * @throws {SoroWillError} If the transaction simulation/submission fails.
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
    * @throws {WillNotFoundError} If the will does not exist.
    * @throws {CheckinNotDueError} If the check-in deadline has not passed.
    * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const { txHash } = await client.triggerWill('1');
+   * console.log(`Will triggered in transaction: ${txHash}`);
+   * ```
    */
   async triggerWill(willId: string, options?: RequestOptions): Promise<{ txHash: string }> {
     parseWillId(willId);
@@ -1087,22 +1313,100 @@ export class SoroWillClient {
     return { txHash };
   }
 
-  /** Cancels an in-progress trigger during the grace period, resetting the countdown. */
+  /**
+   * Cancels an in-progress trigger during the grace period, resetting the countdown.
+   *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks State-changing write operation. Builds, signs, and submits an on-chain transaction that modifies
+   * ledger state to cancel a triggered will and reset its check-in countdown. Requires a connected wallet to sign
+   * and incurs transaction fees. When guardian signature(s) are provided, validates their format before submission.
+   *
+   * @param willId - The identifier of the will to check in for.
+   * @param options - Optional request options or {@link EmergencyCheckInOptions} containing guardian signatures.
+   * @returns An object with the transaction hash and the next check-in deadline.
+   * @throws {InvalidGuardianSignatureError} If a provided guardian signature is empty or malformed.
+   * @throws {SoroWillInvalidIdError} If `willId` is not a valid non-negative integer string.
+   * @throws {SoroWillError} If the transaction fails on-chain.
+   *
+   * @example
+   * ```ts
+   * // Standard emergency check-in by owner
+   * const { txHash, nextDeadline } = await client.emergencyCheckIn('42');
+   * console.log(`Emergency check-in confirmed: ${txHash}, next deadline: ${nextDeadline}`);
+   *
+   * // Emergency check-in with guardian signature
+   * const { txHash } = await client.emergencyCheckIn('42', {
+   *   guardianSignature: 'AAAA...',
+   * });
+   * ```
+   */
   async emergencyCheckIn(
     willId: string,
+    options?: EmergencyCheckInOptions,
+  ): Promise<{ txHash: string; nextDeadline: Date }>;
+  async emergencyCheckIn(
+    willId: string,
+    guardianSignature?: string,
+    options?: RequestOptions,
+  ): Promise<{ txHash: string; nextDeadline: Date }>;
+  async emergencyCheckIn(
+    willId: string,
+    guardianSignatureOrOptions?: string | EmergencyCheckInOptions,
     options?: RequestOptions,
   ): Promise<{ txHash: string; nextDeadline: Date }> {
     parseWillId(willId);
+
+    let guardianSig: string | undefined;
+    let guardianSigs: string[] | undefined;
+    let requestOptions: RequestOptions | undefined;
+
+    if (typeof guardianSignatureOrOptions === 'string') {
+      guardianSig = guardianSignatureOrOptions;
+      requestOptions = options;
+    } else if (typeof guardianSignatureOrOptions === 'object' && guardianSignatureOrOptions !== null) {
+      guardianSig = guardianSignatureOrOptions.guardianSignature;
+      guardianSigs = guardianSignatureOrOptions.guardianSignatures;
+      requestOptions = guardianSignatureOrOptions;
+    } else {
+      requestOptions = options;
+    }
+
+    if (guardianSig !== undefined) {
+      validateGuardianSignature(guardianSig);
+    }
+    if (guardianSigs !== undefined) {
+      if (!Array.isArray(guardianSigs) || guardianSigs.length === 0) {
+        throw new InvalidGuardianSignatureError(
+          undefined,
+          'Invalid guardian signature: guardianSignatures list must not be empty when provided.',
+        );
+      }
+      for (const sig of guardianSigs) {
+        validateGuardianSignature(sig);
+      }
+    }
+
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
     const owner = await this.getWalletPublicKey();
     // checkin_period_days is a stored will property not returned by the
     // contract's emergency_checkin function, so a separate getWill() read is
     // unavoidable in order to compute the nextDeadline return value.
-    const will = await this.getWill(willId, options);
+    const will = await this.getWill(willId, requestOptions);
+    const invokeArgs: Record<string, unknown> = {
+      will_id: parseWillId(willId),
+      owner,
+    };
+    if (guardianSig !== undefined) {
+      invokeArgs.guardian_signature = guardianSig;
+    } else if (guardianSigs !== undefined) {
+      invokeArgs.guardian_signatures = guardianSigs;
+    }
+
     const { txHash, createdAt } = await this.invoke(
       'emergency_checkin',
-      { will_id: parseWillId(willId), owner },
-      options,
+      invokeArgs,
+      requestOptions,
     );
     return {
       txHash,
@@ -1113,12 +1417,47 @@ export class SoroWillClient {
   /**
    * Distributes the will's balance to all beneficiaries once the grace period has elapsed.
    *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks State-changing write operation. Builds, signs, and submits an on-chain transaction that modifies
+   * ledger state to distribute locked assets to beneficiaries and transition will status to Released. Requires a
+   * connected wallet to sign and consumes transaction fees.
+   *
+   * @param willId - The identifier of the will to release.
+   * @param options - Optional request options.
    * @returns The transaction hash.
    * @throws {SoroWillError} If the transaction simulation/submission fails.
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
    * @throws {WillNotFoundError} If the will does not exist.
    * @throws {WillNotTriggeredError} If the will has not been triggered.
    * @throws {GracePeriodNotExpiredError} If the grace period has not yet expired.
+   * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const { txHash } = await client.releaseInheritance('1');
+   * console.log(`Inheritance released: ${txHash}`);
+   * ```
+   */
+  /**
+   * Distributes the locked balance to beneficiaries after the grace period
+   * expires.
+   *
+   * **Beneficiary funding validation:** Before submitting the release
+   * transaction, the SDK verifies that every beneficiary account exists on
+   * chain and holds enough XLM to cover the trustline reserve required to
+   * receive the will's token. If any beneficiary account is unfunded, the
+   * method throws a {@link BeneficiaryValidationError} with a clear message
+   * naming the unfunded account so the caller can fund it before retrying.
+   *
+   * @param willId - The on-chain will ID.
+   * @param options - Optional per-call timeout and abort signal.
+   * @returns The transaction hash.
+   * @throws {SoroWillInvalidIdError} If `willId` is not a valid numeric ID.
+   * @throws {WillNotFoundError} If the will does not exist.
+   * @throws {BeneficiaryValidationError} If any beneficiary account is not
+   * funded (does not exist on-chain or lacks sufficient XLM for a trustline).
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
    * @throws {Error} If the wallet is not connected or fails to sign.
    */
   async releaseInheritance(
@@ -1127,12 +1466,42 @@ export class SoroWillClient {
   ): Promise<{ txHash: string }> {
     parseWillId(willId);
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
+
+    // Resolve beneficiaries from the will so we can validate funding before
+    // attempting the on-chain release.
+    const will = await this.getWill(willId, options);
+    await this.validateBeneficiariesFunded(will.beneficiaries);
+
     const { txHash } = await this.invoke(
       'release_inheritance',
       { will_id: parseWillId(willId) },
       options,
     );
     return { txHash };
+  }
+
+  /**
+   * Validates that every beneficiary account exists on-chain and holds enough
+   * XLM to satisfy the trustline reserve for receiving the will's token.
+   *
+   * @param beneficiaries - The beneficiary list from the will.
+   * @throws {BeneficiaryValidationError} If any beneficiary account is not
+   *   found on-chain or is unfunded.
+   */
+  private async validateBeneficiariesFunded(
+    beneficiaries: { address: string }[],
+  ): Promise<void> {
+    for (const beneficiary of beneficiaries) {
+      try {
+        await this.server.getAccount(beneficiary.address);
+      } catch {
+        throw new BeneficiaryValidationError(
+          `Beneficiary account "${beneficiary.address}" is not funded on this network. ` +
+            'The account does not exist on-chain. Fund it with the minimum XLM reserve ' +
+            'before attempting to release inheritance.',
+        );
+      }
+    }
   }
 
   /** Cancels the will and withdraws the full balance back to the owner. */
@@ -1159,7 +1528,20 @@ export class SoroWillClient {
     return { txHash, refundAmount: will.balance };
   }
 
-  /** Replaces the beneficiary list for a will before it has been triggered. */
+  /**
+   * Replaces the beneficiary list for a will before it has been triggered.
+   *
+   * The will's existence is validated via `getWill()` before submission. If
+   * the will does not exist, a {@link WillNotFoundError} is thrown before any
+   * transaction is built, avoiding wasted gas and fees.
+   *
+   * @returns The transaction hash.
+   * @throws {BeneficiaryValidationError} If the beneficiary list fails client-side validation.
+   * @throws {SoroWillError} If the transaction simulation/submission fails.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   * @throws {WillNotFoundError} If the will does not exist.
+   * @throws {Error} If the wallet is not connected or fails to sign.
+   */
   async updateBeneficiaries(
     params: UpdateBeneficiariesParams,
     options?: RequestOptions,
@@ -1170,9 +1552,12 @@ export class SoroWillClient {
     }
     if (!validateBeneficiaries(params.beneficiaries)) {
       throw new BeneficiaryValidationError(
-        'Invalid beneficiaries: list must be 1–10 entries, every percentage must be a positive integer, and percentages must sum to exactly 100.',
+        'Invalid beneficiaries: list must be 1–10 entries, every percentage must be a positive number, and percentages must sum to 100.',
       );
     }
+    // Validate will existence before submitting, to avoid wasting gas on a
+    // non-existent will.
+    await this.getWill(params.willId, options);
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
     const owner = await this.getWalletPublicKey();
     const { txHash } = await this.invoke(
@@ -1183,19 +1568,42 @@ export class SoroWillClient {
     return { txHash };
   }
 
-  /** Adds more of the will's token to its locked balance. */
+  /**
+   * Adds more of the will's token to its locked balance.
+   *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks State-changing write operation. Builds, signs, and submits an on-chain transaction that modifies
+   * ledger state to deposit additional tokens into the will. Requires a connected wallet to sign and consumes
+   * transaction fees.
+   *
+   * @param willId - The identifier of the will to top up.
+   * @param amount - The token amount in base units (stroops) as a positive decimal integer string.
+   * @param options - Optional request options.
+   * @returns An object with the transaction hash.
+   * @throws {SoroWillInvalidAmountError} If amount is not a valid positive integer string.
+   * @throws {SoroWillError} If the transaction fails on-chain.
+   *
+   * @example
+   * ```ts
+   * const { txHash } = await client.topUp('1', '5000000');
+   * console.log(`Will topped up: ${txHash}`);
+   * ```
+   */
   async topUp(
     willId: string,
     amount: string,
     options?: RequestOptions,
   ): Promise<{ txHash: string }> {
-    parseWillId(willId);
+    const parsedWillId = parseWillId(willId);
+    // Reject zero, negative, and malformed amounts before touching the wallet or RPC.
+    const parsedAmount = validateAmount(amount);
     await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
     const owner = await this.getWalletPublicKey();
     const { txHash } = await this.invoke('top_up', {
-      will_id: parseWillId(willId),
+      will_id: parsedWillId,
       owner,
-      amount: validateAmount(amount),
+      amount: parsedAmount,
     }, options);
     return { txHash };
   }
@@ -1208,6 +1616,11 @@ export class SoroWillClient {
    * Polls for the final status of a submitted transaction and returns its
    * `createdAt` ledger timestamp and contract return value.
    *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Polls RPC transaction status without modifying ledger state or submitting new transactions.
+   *
    * This is the same polling-and-status-handling logic used internally by
    * all state-changing methods. Consumers who submit transactions through a
    * custom signing flow (e.g. using lower-level
@@ -1219,6 +1632,12 @@ export class SoroWillClient {
    * @returns The ledger creation timestamp and the contract return value, if any.
    * @throws {SoroWillError} If the transaction does not reach `SUCCESS` status.
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   *
+   * @example
+   * ```ts
+   * const { createdAt, returnValue } = await client.waitForTransaction('abc123hash');
+   * console.log(`Transaction confirmed at ledger timestamp: ${createdAt}`);
+   * ```
    */
   async waitForTransaction(
     txHash: string,
@@ -1227,6 +1646,7 @@ export class SoroWillClient {
     const txResponse = await this.rpc(
       () => this.server.pollTransaction(txHash, { attempts: this.pollAttempts }),
       options,
+      'pollTransaction',
     );
 
     if (txResponse.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
@@ -1246,13 +1666,27 @@ export class SoroWillClient {
 
   /**
    * Proactively check whether the configured RPC endpoint is reachable.
+   *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Probes the RPC health endpoint without modifying ledger state.
    * Useful for showing a 'network unavailable' banner before attempting a real call.
    * Never throws — network failures resolve to `false` rather than propagating an exception.
    *
    * The call goes through the request queue with the client's timeout and RPC failover.
    * A server that does not implement `getHealth` is reported as not healthy (`false`).
    *
+   * @param options - Optional request timeout and abort signal.
    * @returns `true` only if the RPC server reports `status: 'healthy'`, `false` otherwise.
+   *
+   * @example
+   * ```ts
+   * const online = await client.isHealthy();
+   * if (!online) {
+   *   console.warn('RPC endpoint currently unreachable');
+   * }
+   * ```
    */
   async isHealthy(options?: RequestOptions): Promise<boolean> {
     try {
@@ -1265,6 +1699,7 @@ export class SoroWillClient {
             return server.getHealth();
           }),
         options,
+        'getHealth',
       );
       return response?.status === 'healthy';
     } catch {
@@ -1276,6 +1711,11 @@ export class SoroWillClient {
   /**
    * Returns the currently active RPC endpoint URL.
    *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Returns the active local configuration without making network requests.
+   *
    * When multiple RPC endpoints are configured via `rpcUrls`, the pool tracks
    * which endpoint is actively in use. This is useful for debugging regional
    * outages, comparing endpoint reliability, or understanding which backup
@@ -1285,11 +1725,33 @@ export class SoroWillClient {
    * the RpcEndpointPool constructor, so this should not occur in practice)
    *
    * @returns the currently active RPC endpoint URL
+   *
+   * @example
+   * ```ts
+   * const activeUrl = client.getActiveRpcUrl();
+   * console.log(`Currently connected to RPC: ${activeUrl}`);
+   * ```
    */
   getActiveRpcUrl(): string {
     return this.rpcPool.getActiveRpcUrl();
   }
 
+  /**
+   * Fetches a will by its ID.
+   *
+   * **Immutability guarantee:** The returned `Will` object is a fresh clone
+   * (via {@link cloneWill}). Mutating properties on the returned object does
+   * **not** affect internal SDK state or the read cache. When
+   * {@link SoroWillClientOptions.deepFreeze} is `true`, the returned object
+   * is additionally deep-frozen so any mutation attempt throws a `TypeError`.
+   *
+   * @param willId - The on-chain will ID.
+   * @param options - Optional per-call timeout and abort signal.
+   * @returns The will record.
+   * @throws {SoroWillInvalidIdError} If `willId` is not a valid numeric ID.
+   * @throws {WillNotFoundError} If the will does not exist on-chain.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   */
   async getWill(willId: string, options?: RequestOptions): Promise<Will> {
     const canonicalWillId = parseWillId(willId).toString();
     const cacheKey = createReadCacheKey('get_will', { willId: canonicalWillId });
@@ -1297,18 +1759,43 @@ export class SoroWillClient {
       await this.readCache.ready();
       const cached = this.readCache.get<Will>(cacheKey);
       if (cached !== undefined) {
-        return cloneWill(cached);
+        const cloned = cloneWill(cached);
+        return this.deepFreeze ? deepFreezeObject(cloned) : cloned;
       }
     }
     const raw = await this.read<unknown>('get_will', { will_id: BigInt(canonicalWillId) }, options);
     const will = mapWill(raw);
     this.readCache?.set(cacheKey, cloneWill(will), [canonicalWillId]);
-    return will;
+    return this.deepFreeze ? deepFreezeObject(will) : will;
   }
 
-  /** Lists every will owned by `owner`. Does not require a connected wallet. */
+  /**
+   * Lists every will owned by `owner`. Does not require a connected wallet.
+   *
+   * **Immutability guarantee:** The returned `Will[]` array and each element
+   * are fresh clones. Mutating the array or any `Will` property does **not**
+   * affect internal SDK state or the read cache. When
+   * {@link SoroWillClientOptions.deepFreeze} is `true`, each returned object
+   * is deep-frozen so any mutation attempt throws a `TypeError`.
+   *
+   * @param owner - The Stellar public key of the will owner.
+   * @param options - Optional pagination and per-call timeout/abort signal.
+   * @returns An array of will records owned by `owner`.
+   * @throws {InvalidCursorError} If a pagination cursor is invalid.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   */
   async getWillsByOwner(owner: string, options?: RequestOptions): Promise<Will[]>;
-  /** Lists every will owned by `owner`, one client-side page at a time. Does not require a connected wallet. */
+  /**
+   * Lists every will owned by `owner`, one client-side page at a time. Does
+   * not require a connected wallet.
+   *
+   * **Immutability guarantee:** Same as {@link getWillsByOwner} — returned
+   * objects are clones (deep-frozen when `deepFreeze` is enabled).
+   *
+   * @param owner - The Stellar public key of the will owner.
+   * @param options - Pagination options plus optional timeout/abort signal.
+   * @returns A paginated page of will records.
+   */
   async getWillsByOwner(
     owner: string,
     options: PaginationOptions & RequestOptions,
@@ -1329,21 +1816,54 @@ export class SoroWillClient {
       await this.readCache.ready();
       const cached = this.readCache.get<Will[]>(cacheKey);
       if (cached !== undefined) {
-        return this.paginate(cached.map(cloneWill), options);
+        const cloned = cached.map(cloneWill);
+        return this.paginate(
+          this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
+          options,
+        );
       }
     }
     const raw = await this.read<unknown>('get_wills_by_owner', { owner }, options);
     const wills = mapWillList(raw);
     this.readCache?.set(cacheKey, wills.map(cloneWill), wills.map((will) => will.id));
-    return this.paginate(wills, options);
+    const cloned = wills.map(cloneWill);
+    return this.paginate(
+      this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
+      options,
+    );
   }
 
-  /** Lists every will `beneficiary` is named in. Does not require a connected wallet. */
+  /**
+   * Lists every will `beneficiary` is named in. Does not require a connected
+   * wallet.
+   *
+   * **Immutability guarantee:** The returned `Will[]` array and each element
+   * are fresh clones. Mutating the array or any `Will` property does **not**
+   * affect internal SDK state or the read cache. When
+   * {@link SoroWillClientOptions.deepFreeze} is `true`, each returned object
+   * is deep-frozen so any mutation attempt throws a `TypeError`.
+   *
+   * @param beneficiary - The Stellar public key of the beneficiary.
+   * @param options - Optional pagination and per-call timeout/abort signal.
+   * @returns An array of will records naming `beneficiary`.
+   * @throws {InvalidCursorError} If a pagination cursor is invalid.
+   * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
+   */
   async getWillsByBeneficiary(
     beneficiary: string,
     options?: RequestOptions,
   ): Promise<Will[]>;
-  /** Lists every will `beneficiary` is named in, one client-side page at a time. Does not require a connected wallet. */
+  /**
+   * Lists every will `beneficiary` is named in, one client-side page at a
+   * time. Does not require a connected wallet.
+   *
+   * **Immutability guarantee:** Same as {@link getWillsByBeneficiary} —
+   * returned objects are clones (deep-frozen when `deepFreeze` is enabled).
+   *
+   * @param beneficiary - The Stellar public key of the beneficiary.
+   * @param options - Pagination options plus optional timeout/abort signal.
+   * @returns A paginated page of will records.
+   */
   async getWillsByBeneficiary(
     beneficiary: string,
     options: PaginationOptions & RequestOptions,
@@ -1364,7 +1884,11 @@ export class SoroWillClient {
       await this.readCache.ready();
       const cached = this.readCache.get<Will[]>(cacheKey);
       if (cached !== undefined) {
-        return this.paginate(cached.map(cloneWill), options);
+        const cloned = cached.map(cloneWill);
+        return this.paginate(
+          this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
+          options,
+        );
       }
     }
     const raw = await this.read<unknown>(
@@ -1374,7 +1898,11 @@ export class SoroWillClient {
     );
     const wills = mapWillList(raw);
     this.readCache?.set(cacheKey, wills.map(cloneWill), wills.map((will) => will.id));
-    return this.paginate(wills, options);
+    const cloned = wills.map(cloneWill);
+    return this.paginate(
+      this.deepFreeze ? cloned.map(deepFreezeObject) : cloned,
+      options,
+    );
   }
 
   /**
@@ -1405,6 +1933,13 @@ export class SoroWillClient {
    * Casts a guardian vote to force an early release of `willId`. Once 2 of
    * the will's guardians have voted, the balance is released automatically.
    *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks Write operation. Submits a signed transaction to cast a guardian vote, altering ledger state.
+   * Requires a connected wallet with guardian authorization.
+   *
+   * @param willId - The identifier of the will to vote on.
+   * @param options - Optional request options.
    * @returns The transaction hash.
    * @throws {SoroWillError} If the transaction simulation/submission fails.
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
@@ -1412,6 +1947,12 @@ export class SoroWillClient {
    * @throws {NotGuardianError} If the caller is not a guardian of this will.
    * @throws {AlreadyVotedError} If this guardian has already voted.
    * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const { txHash } = await client.guardianTrigger('1');
+   * console.log(`Guardian vote submitted: ${txHash}`);
+   * ```
    */
   async guardianTrigger(willId: string, options?: RequestOptions): Promise<{ txHash: string }> {
     parseWillId(willId);
@@ -1461,20 +2002,72 @@ export class SoroWillClient {
   }
 
   /**
+   * Validates that every operation in a batch targets the same Stellar network
+   * and that this network is the one the client is configured for (#550).
+   *
+   * Operations that omit `network` inherit the client's network. Any operation
+   * that declares a different network — or two operations that declare
+   * *different* networks — is rejected with a {@link BatchNetworkMismatchError}
+   * before any transaction is built, signed, or submitted.
+   */
+  private assertBatchNetworks(operations: readonly BatchOperation[]): void {
+    let declaredNetwork: SoroWillNetwork | undefined;
+    let declaredIndex = -1;
+
+    operations.forEach((operation, index) => {
+      const network = operation.network;
+      if (network === undefined) {
+        // Inherits the client's network — always compatible.
+        return;
+      }
+      if (declaredNetwork !== undefined && declaredNetwork !== network) {
+        throw new BatchNetworkMismatchError(this.network, network, index, {
+          operationIndex: declaredIndex,
+          network: declaredNetwork,
+        });
+      }
+      declaredNetwork = network;
+      declaredIndex = index;
+    });
+
+    // Every declared network agrees with itself — now check they also agree
+    // with the network this client is configured for.
+    if (declaredNetwork !== undefined && declaredNetwork !== this.network) {
+      throw new BatchNetworkMismatchError(
+        this.network,
+        declaredNetwork,
+        declaredIndex,
+        undefined,
+      );
+    }
+  }
+
+  /**
    * Simulates, signs, and submits a raw contract call given by its native method name and arguments.
    * Arguments use the native names and values accepted by the deployed contract spec.
    *
-   * Soroban transactions may contain only a single `InvokeHostFunction` operation, so a batch
-   * must contain exactly one operation; multiple calls cannot be combined into one atomic
-   * transaction and must be submitted separately.
+   * **Maximum batch size: 1.** Soroban transactions may contain only a single
+   * `InvokeHostFunction` operation, so a batch must contain exactly one
+   * operation; multiple calls cannot be combined into one atomic transaction
+   * and must be submitted separately.
    *
+   * @param operations - Array containing a single {@link BatchOperation}.
+   * @param options - Optional request options.
    * @returns The transaction hash and creation timestamp.
    * @throws {RangeError} If the batch contains zero operations.
-   * @throws {UnsupportedBatchSizeError} If the batch contains more than one operation.
+   * @throws {UnsupportedBatchSizeError} If the batch contains more than one operation (i.e. exceeds the maximum batch size of 1).
    * @throws {SoroWillError} If the transaction simulation/submission fails.
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout.
    * @throws {WillContractError} Mapped contract-level errors from any operation in the batch.
    * @throws {Error} If the wallet is not connected or fails to sign.
+   *
+   * @example
+   * ```ts
+   * const result = await client.batch([
+   *   { method: 'check_in', args: { will_id: 1n } }
+   * ]);
+   * console.log(`Batch operation txHash: ${result.txHash}`);
+   * ```
    */
   async batch(
     operations: readonly BatchOperation[],
@@ -1483,6 +2076,13 @@ export class SoroWillClient {
     if (operations.length === 0) {
       throw new RangeError('A batch must contain at least one operation');
     }
+    // #550: every operation must target the same network, and that network
+    // must be the one the client is configured for. This runs before any
+    // transaction is built, signed, or submitted so a batch can never mix
+    // testnet and mainnet operations. It is checked before the batch-size
+    // limit so a mixed-network batch reports the network problem rather
+    // than the size problem.
+    this.assertBatchNetworks(operations);
     if (operations.length > 1) {
       throw new UnsupportedBatchSizeError(operations.length);
     }
@@ -1515,6 +2115,7 @@ export class SoroWillClient {
         const account = await this.rpc(
           () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),
           options,
+          'getAccount',
         );
         const builder = new TransactionBuilder(account, {
           fee: BASE_FEE,
@@ -1528,6 +2129,7 @@ export class SoroWillClient {
         const prepared = await this.rpc(
           () => this.rpcPool.withFailover((server) => server.prepareTransaction(builtTx)),
           options,
+          'batch:prepareTransaction',
         );
 
         assertPreparedTransactionMatchesIntendedOperation({
@@ -1537,9 +2139,7 @@ export class SoroWillClient {
           context: 'batch',
         });
 
-        const signedTxResponse = await this.wallet.signTransaction(prepared.toXDR(), {
-          networkPassphrase: this.networkPassphrase,
-        });
+        const signedTxResponse = await this.signWithWallet(prepared.toXDR());
         const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
         const result = await this.submitSignedTransaction(signedTxXdr, options);
         txHash = result.txHash;
@@ -1563,11 +2163,134 @@ export class SoroWillClient {
   }
 
   /**
+   * Submits a queue of contract calls one after another, each as its own
+   * transaction (Soroban allows one contract invocation per transaction, see
+   * {@link batch}), and reports a per-operation outcome instead of throwing on
+   * the first failure.
+   *
+   * Partial failures are handled explicitly rather than leaving later
+   * operations queued against stale state:
+   * - A failing operation is retried up to `maxRetries` times. Contract errors
+   *   and wallet network mismatches are deterministic and are not retried.
+   * - With `onFailure: 'stop'` (the default), every operation after a failure
+   *   is marked `skipped` and never submitted. With `'continue'`, the rest of
+   *   the queue still runs.
+   * - Cached reads for every will touched by the queue are invalidated, so a
+   *   subsequent read reflects whatever actually landed on-chain.
+   * - Aborting `options.signal` marks every not-yet-submitted operation `skipped`.
+   *
+   * Operations that already succeeded are not rolled back — Soroban
+   * transactions are final once they land.
+   *
+   * @returns A {@link BatchQueueResult} with one entry per operation, in queue order.
+   * @throws {RangeError} If the queue is empty or `maxRetries` is not a non-negative integer.
+   */
+  async batchSequential(
+    operations: readonly BatchOperation[],
+    options: BatchQueueOptions = {},
+  ): Promise<BatchQueueResult> {
+    if (operations.length === 0) {
+      throw new RangeError('A batch must contain at least one operation');
+    }
+    const { onFailure = 'stop', maxRetries = 0, ...requestOptions } = options;
+    if (!Number.isInteger(maxRetries) || maxRetries < 0) {
+      throw new RangeError('maxRetries must be a non-negative integer');
+    }
+
+    const results: BatchOperationResult[] = [];
+    let halted: Error | undefined;
+
+    for (const [index, { method, args }] of operations.entries()) {
+      if (!halted && requestOptions.signal?.aborted) {
+        halted = new SoroWillError('Batch aborted before this operation was submitted', {
+          cause: requestOptions.signal.reason,
+        });
+      }
+      if (halted) {
+        results.push({ index, method, status: 'skipped', error: halted, attempts: 0 });
+        continue;
+      }
+
+      let attempts = 0;
+      let lastError: Error | undefined;
+      while (attempts <= maxRetries) {
+        attempts++;
+        try {
+          const { txHash } = await this.invoke(method, args, requestOptions);
+          results.push({ index, method, status: 'success', txHash, attempts });
+          lastError = undefined;
+          break;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (
+            err instanceof WillContractError ||
+            err instanceof WalletNetworkMismatchError ||
+            requestOptions.signal?.aborted
+          ) {
+            break;
+          }
+        }
+      }
+
+      if (lastError) {
+        results.push({ index, method, status: 'failed', error: lastError, attempts });
+        if (onFailure === 'stop') {
+          halted = new SoroWillError(
+            `Skipped because operation ${index} (${method}) failed: ${lastError.message}`,
+            { cause: lastError },
+          );
+        }
+      }
+    }
+
+    if (this.readCache) {
+      const willIds = new Set(
+        operations
+          .map(({ args }) => args.will_id)
+          .filter((willId) => willId !== undefined && willId !== null)
+          .map((willId) => String(willId)),
+      );
+      await Promise.all([...willIds].map((willId) => this.readCache!.invalidateByWillId(willId)));
+    }
+
+    const count = (status: BatchOperationResult['status']): number =>
+      results.filter((result) => result.status === status).length;
+    const succeededCount = count('success');
+    return {
+      success: succeededCount === operations.length,
+      results,
+      succeededCount,
+      failedCount: count('failed'),
+      skippedCount: count('skipped'),
+    };
+  }
+
+  /**
    * Builds a SEP-7 deep-link URI for a state-changing contract call, so a
    * mobile wallet can sign it outside the browser extension flow.
    *
+   * **Operation Type:** Read-only (Builder)
+   *
+   * @readonly
+   * @remarks Read-only builder operation. Simulates and prepares transaction XDR and creates a URI without submitting a transaction or modifying ledger state.
+   *
+   * @param method - The contract method name to invoke.
+   * @param args - Arguments to pass to the method.
+   * @param sourcePublicKey - Public key of the account executing the transaction.
+   * @param options - Options for the SEP-7 URI construction.
    * @returns The `web+stellar:tx?...` URI string.
    * @throws {Error} If the RPC call to build the transaction fails.
+   *
+   * @example
+   * ```ts
+   * const uri = await client.buildSep7SigningUri(
+   *   'check_in',
+   *   { will_id: 1n },
+   *   'GSOURCE...',
+   *   { callback: 'https://example.com/callback' }
+   * );
+   * console.log(`SEP-7 URI: ${uri}`);
+   * ```
    */
   async buildSep7SigningUri(
     method: string,
@@ -1595,11 +2318,64 @@ export class SoroWillClient {
    * network would charge, without signing or submitting anything. Useful for
    * showing a fee estimate in a UI before the user commits to a transaction.
    *
-   * `resourceFee` is the operation-specific Soroban resource cost (CPU, RAM,
-   * ledger I/O, storage). `totalFee` adds the base inclusion fee, giving the
-   * minimum total fee the network will accept for this call.
+   * ## Fee calculation strategy
    *
+   * The estimate is produced by a read-only Soroban simulation:
+   *
+   * 1. `resourceFee` = `simulation.minResourceFee` — the operation-specific
+   *    Soroban resource cost (CPU instructions, memory, ledger reads/writes,
+   *    storage rent). A `merge_wills` with many beneficiaries costs far more
+   *    than a `check_in`.
+   * 2. `totalFee` = `BASE_FEE` + `resourceFee` — the minimum total fee (in
+   *    stroops) the network will accept for this call. `BASE_FEE` is the
+   *    per-operation inclusion fee.
+   *
+   * The returned fees are strings (base-10 stroops) and can be displayed
+   * directly or converted with {@link formatUSDC} / {@link formatTokenAmount}.
+   *
+   * ## Custom fee support
+   *
+   * The SDK does not expose an arbitrary per-transaction `maxFee` override.
+   * Instead, fee control is handled through:
+   *
+   * - `autoFeeBumpOnTimeout` (client option): if a transaction doesn't land
+   *   within the poll window, the SDK automatically rebuilds and resubmits it
+   *   with a higher fee instead of throwing.
+   * - `transactionTimeoutSeconds` (client option): the validity window set on
+   *   every built transaction via `setTimeout()`.
+   * - `previewFee`: simulate the actual cost before the user commits, so the
+   *   UI can surface an accurate estimate rather than a hardcoded value.
+   *
+   * State-changing SDK calls always simulate via `prepareTransaction` before
+   * submission, so the submitted fee already includes the simulated resource
+   * fee — you generally do not need to size fees manually.
+   *
+   * ## Examples
+   *
+   * ```ts
+   * const { resourceFee, totalFee } = await client.previewFee('check_in', {
+   *   will_id: '42',
+   *   owner: ownerPublicKey,
+   * });
+   * console.log(`Estimated total fee: ${totalFee} stroops`);
+   *
+   * // Show the estimate in a UI before the user signs.
+   * if (BigInt(totalFee) > MAX_ACCEPTABLE_FEE) {
+   *   warnUser('Fee is higher than expected');
+   * }
+   * ```
+   *
+   * @param method - The contract method name to simulate.
+   * @param args - Native arguments to pass to the contract method.
+   * @param options - Optional request options.
+   * @returns Object containing `resourceFee` and `totalFee` as stringified Stroops.
    * @see https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering
+   *
+   * @example
+   * ```ts
+   * const { resourceFee, totalFee } = await client.previewFee('check_in', { will_id: 1n });
+   * console.log(`Estimated fee: ${totalFee} stroops (resource: ${resourceFee})`);
+   * ```
    */
   async previewFee(
     method: string,
@@ -1616,6 +2392,7 @@ export class SoroWillClient {
       const simulation = await this.rpc(
         () => this.rpcPool.withFailover((server) => server.simulateTransaction(tx)),
         options,
+        method,
       );
       if (rpc.Api.isSimulationError(simulation)) {
         throw new SimulationError(method, simulation.error);
@@ -1640,7 +2417,22 @@ export class SoroWillClient {
    * {@link WebSocketNotConfiguredError} instead of silently falling back to
    * polling if `webSocketFactory`/`eventStreamUrl` aren't configured.
    *
+   * **Operation Type:** Read-only (Subscription)
+   *
+   * @readonly
+   * @remarks Read-only subscription operation. Subscribes to contract events via WebSocket or polling without submitting transactions or modifying ledger state.
+   *
+   * @param listener - Callback receiving each incoming {@link SoroWillEvent}.
+   * @param options - Subscription options (transport, cursor, intervals, etc.).
    * @returns A handle that can be used to close the subscription.
+   *
+   * @example
+   * ```ts
+   * const sub = await client.subscribeToEvents((event) => {
+   *   console.log(`Event received: ${event.type}`);
+   * });
+   * // Later: sub.unsubscribe();
+   * ```
    */
   async subscribeToEvents(
     listener: (event: SoroWillEvent) => void,
@@ -1727,7 +2519,17 @@ export class SoroWillClient {
         try {
           const payload = JSON.parse(event.data) as { result?: { events?: RawEventRecord[] } };
           for (const raw of payload.result?.events ?? []) {
-            listener(mapEventRecord(raw, this.getContractId()));
+            if (closed) break;
+            // Isolate listener failures per event so a throwing listener neither
+            // stalls the rest of the batch nor tears down the subscription.
+            try {
+              listener(mapEventRecord(raw, this.getContractId()));
+            } catch (listenerError) {
+              const eventId = raw.id ?? raw.pagingToken ?? 'unknown';
+              options.onError?.(
+                new SoroWillError(`Event listener threw for event ${eventId}`, { cause: listenerError }),
+              );
+            }
           }
         } catch (err) {
           options.onError?.(err instanceof Error ? err : new Error(String(err)));
@@ -1843,7 +2645,7 @@ export class SoroWillClient {
         }
       } catch (err) {
         if (controller.signal.aborted) {
-          options.onError?.(new RequestTimeoutError(this.timeoutMs));
+          options.onError?.(new RequestTimeoutError(this.timeoutMs, 'getEvents'));
         } else {
           options.onError?.(err instanceof Error ? err : new Error(String(err)));
         }
@@ -1860,32 +2662,26 @@ export class SoroWillClient {
   }
 
   /**
-   * Cancels an in-flight state-changing operation started by this client for
-   * `willId`, identified by its contract method name (e.g. `'check_in'`,
-   * `'top_up'`). The pending call rejects with an `AbortError` and its
-   * afterInvoke hooks still run, so callers do not have to wait for the
-   * request timeout (#608).
-   *
-   * To cancel a single call you started yourself, prefer passing an
-   * `AbortSignal` via `options.signal` and aborting its controller.
-   *
-   * @returns `true` if an operation was in flight and has been cancelled.
-   */
-  cancelOperation(willId: string, method: string): boolean {
-    if (!this.inFlightTracker.isInFlight(willId, method)) {
-      return false;
-    }
-    this.inFlightTracker.abort(willId, method);
-    return true;
-  }
-
-  /** Tears down the client: unsubscribes from any event source, aborts all
+   * Tears down the client: unsubscribes from any event source, aborts all
    * in-flight tracked operations, and rejects every queued-but-not-yet-started
-   * request so nothing continues running in the background after teardown. */
+   * request so nothing continues running in the background after teardown.
+   *
+   * **Operation Type:** Read-only (Teardown / Lifecycle)
+   *
+   * @readonly
+   * @remarks Read-only lifecycle operation. Cleans up internal timers, subscriptions, and queues without modifying ledger state.
+   *
+   * @example
+   * ```ts
+   * client.destroy();
+   * ```
+   */
   destroy(): void {
     if (this.eventSubscription) {
       unsubscribeFromWillEvents(this.eventSubscription);
+      this.eventSubscription = undefined;
     }
+    this.stopWatchingWalletNetwork?.();
     this.inFlightTracker.clear();
     this.queue.rejectAll(new Error('SoroWillClient destroyed'));
   }
@@ -1893,9 +2689,22 @@ export class SoroWillClient {
   /**
    * Returns the contract address this client was configured with.
    *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Returns the contract ID from client configuration without network calls or state modification.
+   *
    * Useful when a consumer needs to display which contract a client is
    * connected to (e.g. in a UI or a diagnostic log) without having to hold
    * onto the original `SoroWillClientOptions` object separately.
+   *
+   * @returns The contract ID string.
+   *
+   * @example
+   * ```ts
+   * const contractId = client.getContractId();
+   * console.log(`Target contract: ${contractId}`);
+   * ```
    */
   getContractId(): string {
     return this.contract.contractId();
@@ -1904,10 +2713,23 @@ export class SoroWillClient {
   /**
    * Returns the Stellar network this client was configured with.
    *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Returns the network configuration without network calls or state modification.
+   *
    * Useful when a consumer needs to make decisions based on which network a
    * client was built for — e.g. displaying "connected to testnet" in a UI,
    * or guarding against accidentally running mainnet logic in a test
    * environment.
+   *
+   * @returns The {@link SoroWillNetwork} identifier.
+   *
+   * @example
+   * ```ts
+   * const network = client.getNetwork();
+   * console.log(`Configured network: ${network}`);
+   * ```
    */
   getNetwork(): SoroWillNetwork {
     return this.network;
@@ -1944,6 +2766,7 @@ export class SoroWillClient {
         this.specPromise = this.rpc(
           () => this.server.getContractWasmByContractId(this.contract.contractId()),
           options,
+          'getContractWasmByContractId',
         )
           .then((wasm) => {
             const spec = Spec.fromWasm(Buffer.from(wasm));
@@ -1979,6 +2802,7 @@ export class SoroWillClient {
         this.rpc(
           () => this.rpcPool.withFailover((server) => server.simulateTransaction(tx)),
           options,
+          method,
         ),
       );
       if (rpc.Api.isSimulationError(simulation)) {
@@ -2013,7 +2837,12 @@ export class SoroWillClient {
     args: Record<string, unknown>,
     options?: RequestOptions,
   ): Promise<{ txHash: string; createdAt: number; returnValue: ScVal | undefined; events?: Array<{ topics: string[]; data: unknown }> }> {
-    options?.signal?.throwIfAborted();
+    // #520: Validate that the connected wallet's network matches the client's
+    // configured network before building or signing any transaction. This is a
+    // defense-in-depth check; individual public methods also call
+    // assertWalletNetwork before invoking.
+    await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
+
     const willId = args.will_id === undefined ? undefined : String(args.will_id);
     const execute = async (options: RequestOptions | undefined): Promise<{
       txHash: string;
@@ -2100,33 +2929,18 @@ export class SoroWillClient {
     }
     };
 
-    // Combine the caller's signal with the tracker's per-operation signal so
-    // the operation stops both when the caller aborts and when it is cancelled
-    // via cancelOperation()/destroy() (#608). The abort settles the returned
-    // promise immediately; execute() unwinds through its own abort checkpoints
-    // and still runs afterInvoke hooks for graceful cleanup.
-    const run = (trackerSignal?: AbortSignal): Promise<{
-      txHash: string;
-      createdAt: number;
-      returnValue: ScVal | undefined;
-      events?: Array<{ topics: string[]; data: unknown }>;
-    }> => {
-      const signals = [options?.signal, trackerSignal].filter(
-        (signal): signal is AbortSignal => signal !== undefined,
-      );
-      const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
-      const runOptions = signal === undefined ? options : { ...options, signal };
-      return raceAbort(execute(runOptions), signal);
-    };
-
     if (willId === undefined) {
       return run();
     }
-    // Resolve the signing wallet so the tracker can enforce per-wallet
-    // concurrency limits (#606). A wallet that cannot report its key is not
-    // counted here; submit() surfaces the underlying wallet error itself.
-    const walletAddress = await this.getWalletPublicKey().catch(() => undefined);
-    return this.inFlightTracker.track(willId, method, run, undefined, walletAddress) as Promise<{
+    // Some state-changing methods must never run two concurrent invocations
+    // for the same will: a duplicate would submit a second transaction
+    // on-chain. Those are routed through trackExclusive so the duplicate is
+    // rejected with a DuplicateOperationError instead of being coalesced
+    // onto the in-flight promise (#523).
+    const tracked = EXCLUSIVE_INVOKE_METHODS.has(method)
+      ? this.inFlightTracker.trackExclusive(willId, method, run)
+      : this.inFlightTracker.track(willId, method, run);
+    return tracked as Promise<{
           txHash: string;
           createdAt: number;
           returnValue: ScVal | undefined;
@@ -2174,6 +2988,12 @@ export class SoroWillClient {
   }> {
     options?.signal?.throwIfAborted();
 
+    // #573: Tracks the XDR key added to `signedTransactionHashes` by THIS
+    // submission. Declared outside try/finally so the finally block can
+    // release it after submission completes without clobbering a hash that
+    // a concurrently-detected duplicate attempt is holding.
+    let trackedHash: string | undefined;
+
     try {
       await this.assertWalletNetwork({ networkPassphrase: this.networkPassphrase });
       const publicKey = await this.getWalletPublicKey();
@@ -2183,6 +3003,7 @@ export class SoroWillClient {
         account = await this.rpc(
           () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),
           options,
+          `${label}:getAccount`,
         );
       } catch (getAccountError) {
         // Surface a clear, actionable error when the account is not funded or
@@ -2202,18 +3023,30 @@ export class SoroWillClient {
       const prepared = await this.rpc(
         () => this.rpcPool.withFailover((server) => server.prepareTransaction(builtTx)),
         options,
+        `${label}:prepareTransaction`,
       );
       this.debugLogger.logSimulation(label, undefined, prepared.fee);
 
-      const signedTxResponse = await raceAbort(
-        Promise.resolve(
-          this.wallet.signTransaction(prepared.toXDR(), {
-            networkPassphrase: this.networkPassphrase,
-          }),
-        ),
-        options?.signal,
-      );
-      options?.signal?.throwIfAborted();
+      // #573: Prevent duplicate signing of the same transaction. The
+      // prepared transaction's XDR encodes its full contents (source account,
+      // sequence number, operations, fee, timeout) and is identical before
+      // and after signing, so we can use it as a content-derived key to detect
+      // duplicates before sending to the wallet. The hash is tracked for the
+      // duration of this submission and released in the finally block so that
+      // sequential submissions (e.g. retries) are not blocked.
+      const txXdrKey = prepared.toXDR();
+      if (this.signedTransactionHashes.has(txXdrKey)) {
+        throw new SoroWillError(
+          `Transaction ${txXdrKey.slice(0, 16)}... has already been signed by this client. ` +
+            'Refusing to sign again to prevent duplicate submissions.',
+        );
+      }
+      this.signedTransactionHashes.add(txXdrKey);
+      trackedHash = txXdrKey;
+
+      const signedTxResponse = await this.wallet.signTransaction(prepared.toXDR(), {
+        networkPassphrase: this.networkPassphrase,
+      });
       const signedTxXdr = normalizeSignatureResponse(signedTxResponse);
       const signedTx = TransactionBuilder.fromXDR(
         signedTxXdr,
@@ -2233,6 +3066,7 @@ export class SoroWillClient {
       const sendResponse = await this.rpc(
         () => this.rpcPool.withFailover((server) => server.sendTransaction(signedTx)),
         options,
+        `${label}:sendTransaction`,
       );
       this.debugLogger.logSubmission(label, undefined, sendResponse.hash);
 
@@ -2284,11 +3118,10 @@ export class SoroWillClient {
           const feeBumpPrepared = await this.rpc(
             () => this.rpcPool.withFailover((server) => server.prepareTransaction(feeBumpTx)),
             options,
+            `${label}:prepareTransaction`,
           );
 
-          const feeBumpSignedResponse = await this.wallet.signTransaction(feeBumpPrepared.toXDR(), {
-            networkPassphrase: this.networkPassphrase,
-          });
+          const feeBumpSignedResponse = await this.signWithWallet(feeBumpPrepared.toXDR());
           const feeBumpSignedXdr = normalizeSignatureResponse(feeBumpSignedResponse);
           const feeBumpSignedTx = TransactionBuilder.fromXDR(
             feeBumpSignedXdr,
@@ -2304,6 +3137,7 @@ export class SoroWillClient {
           const feeBumpResponse = await this.rpc(
             () => this.rpcPool.withFailover((server) => server.sendTransaction(feeBumpSignedTx)),
             options,
+            `${label}:sendTransaction`,
           );
 
           if (feeBumpResponse.status === 'ERROR') {
@@ -2343,21 +3177,51 @@ export class SoroWillClient {
         throw error;
       }
       throw mapContractError(error);
+    } finally {
+      // #573: Release the hash only if THIS submission added it, so a
+      // rejected duplicate attempt cannot release a hash still held by the
+      // in-flight original submission.
+      if (trackedHash !== undefined) {
+        this.signedTransactionHashes.delete(trackedHash);
+      }
     }
+  }
+
+  /**
+   * Hands a prepared transaction to the configured wallet for signing, first
+   * verifying that the wallet's session has not expired so a stale session
+   * fails fast with a {@link WalletSessionExpiredError} rather than an opaque
+   * downstream wallet error.
+   */
+  private async signWithWallet(transactionXdr: string): Promise<string | SignatureResponse> {
+    await assertWalletSessionActive(this.wallet);
+    return this.wallet.signTransaction(transactionXdr, {
+      networkPassphrase: this.networkPassphrase,
+    });
   }
 
   /**
    * Builds an unsigned transaction for a contract invocation without simulating it.
    *
+   * **Operation Type:** Read-only (Builder)
+   *
+   * @readonly
+   * @remarks Read-only builder operation. Prepares an unsigned transaction without signing or submitting to the network.
+   *
    * **IMPORTANT:** The returned transaction is **NOT prepared** (not simulated). It lacks the
    * footprint and resource fee estimates that Soroban simulation adds. Signing and submitting
    * this transaction directly will fail for any Soroban invocation that needs these estimates.
    *
-   * To use this for a custom signing flow:
-   * 1. Call this method to build the unsigned transaction XDR
-   * 2. Convert to XDR with `.toXDR()` and pass to your signing mechanism
-   * 3. After signing, call `prepareTransaction()` on the signed XDR to simulate and add fees
-   * 4. Submit the prepared transaction with `submitSignedTransaction()`
+   * Required preparation order (all four steps are required for state-changing calls):
+   * 1. Call `buildTransaction(method, args, sourcePublicKey)` to build the unsigned,
+   *    unprepared transaction XDR.
+   * 2. Call `prepareTransaction(unsignedTx)` on the unsigned XDR to simulate and add
+   *    footprint/resource-fee estimates.
+   * 3. Sign the prepared XDR with your external signing mechanism.
+   * 4. Call `submitSignedTransaction(signedPreparedXdr)` to submit and poll for finality.
+   *
+   * Skipping step 2 (preparation) will cause on-chain submission to fail, because Soroban
+   * transactions require simulated resource fees and footprint entries.
    *
    * Alternatively, use the higher-level state-changing methods (e.g. `createWill()`) which
    * handle building, simulating, signing, and submitting atomically.
@@ -2369,6 +3233,12 @@ export class SoroWillClient {
    * @throws {SimulationError} If the method name or arguments are invalid (during XDR encoding)
    * @throws {AccountNotFundedError} If the source account does not exist on the ledger
    * @throws {RequestTimeoutError} If the RPC request exceeds its configured timeout
+   *
+   * @example
+   * ```ts
+   * const tx = await client.buildTransaction('check_in', { will_id: 1n });
+   * console.log(`Transaction built with sequence: ${tx.sequence}`);
+   * ```
    */
   async buildTransaction(
     method: string,
@@ -2382,6 +3252,10 @@ export class SoroWillClient {
   /**
    * Submits a signed transaction and waits for it to reach a terminal status.
    *
+   * **Operation Type:** Write (State-changing)
+   *
+   * @remarks Write operation. Submits an externally signed transaction to the Soroban RPC and waits for confirmation, modifying ledger state.
+   *
    * For custom signing flows using `buildTransaction()`, the transaction must be prepared
    * (simulated) BEFORE signing. The required workflow is:
    * 1. `buildTransaction()` to build an unsigned, unprepared transaction
@@ -2389,12 +3263,22 @@ export class SoroWillClient {
    * 3. Sign the prepared XDR with your signing mechanism
    * 4. Call this method with the signed XDR to submit and poll
    *
+   * The signed envelope passed here must already be prepared — submitting an unprepared
+   * Soroban transaction will fail on-chain because it lacks simulated resource fees and
+   * footprint entries.
+   *
    * @param signedTxXdr - A signed, prepared transaction XDR string
    * @param options - Optional per-call timeout and abort signal
    * @returns An object with the transaction hash, ledger creation timestamp, and contract return value
    * @throws {SoroWillError} If the XDR is a fee-bump envelope or if the transaction does not succeed
    * @throws {SoroWillError} If RPC submission fails or the node is under backpressure
    * @throws {RequestTimeoutError} If polling exceeds its configured timeout
+   *
+   * @example
+   * ```ts
+   * const result = await client.submitSignedTransaction(signedXdr);
+   * console.log(`Transaction submitted with hash: ${result.txHash}`);
+   * ```
    */
   async submitSignedTransaction(
     signedTxXdr: string,
@@ -2412,11 +3296,13 @@ export class SoroWillClient {
     await this.rpc(
       () => this.rpcPool.withFailover((server) => server.getAccount(publicKey)),
       options,
+      'submitSignedTransaction:getAccount',
     );
     // Safe to fail over: the identical signed envelope can only be applied once.
     const sendResponse = await this.rpc(
       () => this.rpcPool.withFailover((server) => server.sendTransaction(signedTx)),
       options,
+      'submitSignedTransaction:sendTransaction',
     );
 
     if (sendResponse.status === 'ERROR') {
@@ -2436,6 +3322,7 @@ export class SoroWillClient {
           server.pollTransaction(sendResponse.hash, { attempts: this.pollAttempts }),
         ),
       options,
+      'submitSignedTransaction:pollTransaction',
     );
 
     if (txResponse.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
@@ -2452,8 +3339,27 @@ export class SoroWillClient {
   /**
    * Builds a JSON-serializable error report (name, message, code, stack,
    * cause, SDK context) that users can attach to a support request.
+   *
+   * **Operation Type:** Read-only (Utility)
+   *
+   * @readonly
+   * @remarks Read-only utility operation. Formats an error into a structured diagnostic report without network requests or state changes.
+   *
    * Stack traces are always included here since the caller explicitly asks
    * for the report; routine logging only includes stacks when `debug` is on.
+   *
+   * @param error - The error to format.
+   * @returns A structured record suitable for error logging or support tickets.
+   *
+   * @example
+   * ```ts
+   * try {
+   *   await client.createWill({ ... });
+   * } catch (err) {
+   *   const report = client.reportError(err);
+   *   console.error('Support ticket payload:', report);
+   * }
+   * ```
    */
   reportError(error: unknown): Record<string, unknown> {
     const err = error instanceof Error ? error : new Error(String(error));
@@ -2470,6 +3376,23 @@ export class SoroWillClient {
     };
   }
 
+  /**
+   * Clears the cached contract specification and re-fetches it from the RPC.
+   *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Clears the cached contract specification and re-fetches it from the RPC without modifying ledger state.
+   *
+   * @param options - Optional request options.
+   * @returns The refreshed {@link Spec} instance.
+   *
+   * @example
+   * ```ts
+   * const spec = await client.refreshSpec();
+   * console.log(`Refreshed contract spec methods: ${spec.funcs().length}`);
+   * ```
+   */
   async refreshSpec(options?: RequestOptions): Promise<InstanceType<typeof Spec>> {
     this.specPromise = undefined;
     this.specResolvedAt = undefined;
@@ -2478,6 +3401,11 @@ export class SoroWillClient {
 
   /**
    * Returns network-wide inclusion-fee statistics (`rpc.Api.GetFeeStatsResponse`).
+   *
+   * **Operation Type:** Read-only (Query)
+   *
+   * @readonly
+   * @remarks Read-only query operation. Queries current network fee statistics from the RPC node without modifying ledger state.
    *
    * **Note:** these stats cover only the *inclusion* fee. Soroban invocations
    * also pay a resource fee (CPU instructions, memory, ledger reads/writes,
@@ -2488,9 +3416,28 @@ export class SoroWillClient {
    * `prepareTransaction` before submission, so the submitted fee already
    * includes the simulated resource fee.
    *
-   * @see https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering
+   * Results are cached per network passphrase (keyed by the wallet's current
+   * passphrase) and flushed automatically when the wallet switches networks,
+   * so you never see stale fees from a previous network. Call
+   * {@link flushFeeStatsCache} to force a refresh after a network switch.
    *
+   * ## Example
+   *
+   * ```ts
+   * const stats = await client.getNetworkFeeStats();
+   * console.log('Fee stats:', stats);
+   * // Use `previewFee` for an operation-specific estimate rather than these
+   * // network-wide stats alone.
+   * ```
+   *
+   * @see https://developers.stellar.org/docs/learn/fundamentals/fees-resource-limits-metering
    * @throws {SoroWillError} If the configured RPC server does not support `getFeeStats`.
+   *
+   * @example
+   * ```ts
+   * const stats = await client.getNetworkFeeStats();
+   * console.log(`Fee stats p90: ${stats.sorobanInclusionFee.p90}`);
+   * ```
    */
   async getNetworkFeeStats(options?: RequestOptions): Promise<rpc.Api.GetFeeStatsResponse> {
     const server = this.server;
@@ -2513,7 +3460,7 @@ export class SoroWillClient {
       return cached;
     }
 
-    const result = await this.rpc(() => server.getFeeStats!(), options);
+    const result = await this.rpc(() => server.getFeeStats!(), options, 'getFeeStats');
     this.feeStatsCache.set(cacheKey, result);
     this.lastFeeStatsCachedPassphrase = currentPassphrase;
     return result;
@@ -2521,21 +3468,24 @@ export class SoroWillClient {
 
   /**
    * Flushes the in-memory fee-stats cache for all networks.
+   *
+   * **Operation Type:** Read-only (Cache Invalidation)
+   *
+   * @readonly
+   * @remarks Read-only cache maintenance operation. Clears the in-memory fee stats cache without modifying ledger state.
+   *
    * Call this after detecting a wallet network switch to guarantee the next
    * `getNetworkFeeStats()` call fetches fresh data from the RPC node.
+   *
+   * @example
+   * ```ts
+   * client.flushFeeStatsCache();
+   * ```
    */
   flushFeeStatsCache(): void {
     this.feeStatsCache.clear();
   }
 
-  /**
-   * Verifies the wallet is on the expected network before signing.
-   *
-   * - Wallets that do not implement `getNetwork` are not checked (explicit opt-out).
-   * - If `getNetwork` rejects, a {@link SoroWillError} is thrown with the original error as `cause`.
-   * - An empty or missing passphrase cannot be verified and is treated as a mismatch
-   *   ({@link WalletNetworkMismatchError} with an empty `actualNetworkPassphrase`).
-   */
   /**
    * Inclusion fee for a replacement transaction: the network's p90 Soroban inclusion
    * fee (from fee stats) per operation, but never below the 10x multiplier stellar-core
@@ -2553,8 +3503,35 @@ export class SoroWillClient {
     }
   }
 
+  /**
+   * Verifies the wallet is on the expected network before signing.
+   *
+   * **Operation Type:** Read-only (Validation)
+   *
+   * @readonly
+   * @remarks Read-only validation operation. Checks the wallet network against expected passphrase without modifying ledger state.
+   *
+   * - Wallets that do not implement `getNetwork` are not checked (explicit opt-out).
+   * - If `getNetwork` rejects, a {@link SoroWillError} is thrown with the original error as `cause`.
+   * - An empty or missing passphrase cannot be verified and is treated as a mismatch
+   *   ({@link WalletNetworkMismatchError} with an empty `actualNetworkPassphrase`).
+   *
+   * @param network - Object containing expected `networkPassphrase`.
+   * @throws {SoroWillError} If reading wallet network fails.
+   * @throws {WalletNetworkMismatchError} If wallet network doesn't match expected.
+   *
+   * @example
+   * ```ts
+   * await client.assertWalletNetwork({ networkPassphrase: 'Test SDF Network ; September 2015' });
+   * ```
+   */
   async assertWalletNetwork(network: { networkPassphrase: string }): Promise<void> {
     if (!this.wallet.getNetwork) {
+      if (this.requireWalletNetwork) {
+        throw new SoroWillError(
+          'The wallet adapter cannot report its network (no getNetwork method), and requireWalletNetwork is enabled; refusing to sign',
+        );
+      }
       return;
     }
 
@@ -2575,11 +3552,14 @@ export class SoroWillClient {
   // -----------------------------------------------------------------------
 
   /** Sends every RPC through the shared FIFO queue with the selected timeout. */
-  private rpc<T>(request: () => Promise<T>, options?: RequestOptions): Promise<T> {
+  private rpc<T>(request: () => Promise<T>, options?: RequestOptions, method?: string): Promise<T> {
     options?.signal?.throwIfAborted();
-    return raceAbort(
-      this.queue.enqueue(request, options?.timeoutMs ?? this.timeoutMs, options?.signal),
+    return this.queue.enqueue(
+      request,
+      options?.timeoutMs ?? this.timeoutMs,
       options?.signal,
+      undefined,
+      method,
     );
   }
 
